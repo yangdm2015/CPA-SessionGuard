@@ -608,15 +608,17 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 
 // SessionAffinitySelector wraps another selector with session-sticky behavior.
 // It extracts session ID from multiple sources and maintains session-to-auth
-// mappings with automatic failover when the bound auth becomes unavailable.
+// mappings with configurable failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	strict   bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback Selector
+	Strict   bool
 	TTL      time.Duration
 }
 
@@ -639,6 +641,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	return &SessionAffinitySelector{
 		fallback: cfg.Fallback,
 		cache:    NewSessionCache(cfg.TTL),
+		strict:   cfg.Strict,
 	}
 }
 
@@ -706,6 +709,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
+		if s.strict {
+			return nil, strictSessionAuthUnavailableError()
+		}
 		// Cached auth not available, reselect via fallback selector for even distribution
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
@@ -725,6 +731,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					return auth, nil
 				}
 			}
+			if s.strict {
+				return nil, strictSessionAuthUnavailableError()
+			}
 		}
 	}
 
@@ -735,6 +744,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	bind(auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func strictSessionAuthUnavailableError() *Error {
+	return &Error{
+		Code:       "session_auth_unavailable",
+		Message:    "bound session auth is temporarily unavailable",
+		Retryable:  true,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -765,7 +783,7 @@ func (s *SessionAffinitySelector) Stop() {
 // InvalidateAuth removes all session bindings for a specific auth.
 // Called when an auth becomes rate-limited or unavailable.
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
-	if s.cache != nil {
+	if s.cache != nil && !s.strict {
 		s.cache.InvalidateAuth(authID)
 	}
 }
@@ -799,6 +817,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		if fallbackKey != "" {
 			s.cache.Touch(fallbackKey, res.AuthID)
 		}
+		return
+	}
+	if s.strict {
 		return
 	}
 
