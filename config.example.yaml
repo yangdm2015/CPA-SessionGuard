@@ -211,13 +211,19 @@ routing:
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
   # execution or derived session identity, and the existing first-message hash fallback.
-  # Automatic failover is always enabled when bound auth becomes unavailable.
+  # Automatic failover is enabled when bound auth becomes unavailable unless strict is true.
   # An established binding outranks credential priority: once a session is bound, that
   # credential is kept even if a higher-priority credential recovers. Credential priority
   # still decides cold bindings, requests without a session, and post-failover rebinding.
   session-affinity: false # default: false
+  # Return retryable 503 for an unavailable bound auth instead of silently switching accounts.
+  session-affinity-strict: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Persist private session/auth mappings under auth-dir so restarts retain bindings.
+  session-affinity-persist: false
+  # Optional override. Default: <auth-dir>/.session-affinity.sab
+  # session-affinity-store: "/var/lib/cliproxyapi/session-affinity.sab"
 
 # Codex provider behavior.
 codex:

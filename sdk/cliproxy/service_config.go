@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,10 +26,12 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy              string
-	sessionAffinity       bool
-	sessionAffinityStrict bool
-	sessionAffinityTTL    time.Duration
+	strategy                 string
+	sessionAffinity          bool
+	sessionAffinityStrict    bool
+	sessionAffinityTTL       time.Duration
+	sessionAffinityPersist   bool
+	sessionAffinityStorePath string
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -48,9 +51,16 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	state.sessionAffinityStrict = cfg.Routing.SessionAffinityStrict
+	state.sessionAffinityPersist = cfg.Routing.SessionAffinityPersist
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
 			state.sessionAffinityTTL = parsed
+		}
+	}
+	if state.sessionAffinityPersist {
+		state.sessionAffinityStorePath = strings.TrimSpace(cfg.Routing.SessionAffinityStore)
+		if state.sessionAffinityStorePath == "" {
+			state.sessionAffinityStorePath = filepath.Join(strings.TrimSpace(cfg.AuthDir), ".session-affinity.sab")
 		}
 	}
 	return state
@@ -67,10 +77,15 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.RoundRobinSelector{}
 	}
 	if state.sessionAffinity {
+		var store coreauth.SessionBindingStore
+		if state.sessionAffinityPersist {
+			store = coreauth.NewFileSessionBindingStore(state.sessionAffinityStorePath)
+		}
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 			Fallback: selector,
 			Strict:   state.sessionAffinityStrict,
 			TTL:      state.sessionAffinityTTL,
+			Store:    store,
 		})
 	}
 	return selector

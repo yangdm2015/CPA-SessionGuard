@@ -151,6 +151,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			if len(chunk.Payload) == 0 {
 				return true
 			}
+			recordSessionAffinityResponseID(&opts, chunk.Payload, true)
 			payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
 			if len(payload) == 0 {
 				return true

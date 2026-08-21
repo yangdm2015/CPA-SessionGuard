@@ -241,6 +241,13 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// SessionAffinityPersist saves bindings so stateful sessions survive restarts.
+	SessionAffinityPersist bool `yaml:"session-affinity-persist,omitempty" json:"session-affinity-persist,omitempty"`
+
+	// SessionAffinityStore optionally overrides the persistent binding file path.
+	// The default is .session-affinity.sab under auth-dir.
+	SessionAffinityStore string `yaml:"session-affinity-store,omitempty" json:"session-affinity-store,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
