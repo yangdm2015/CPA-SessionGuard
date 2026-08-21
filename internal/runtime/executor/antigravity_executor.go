@@ -63,6 +63,19 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
+func antigravityUnsupportedCompactionTriggerError(payload []byte) error {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return nil
+	}
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "compaction_trigger" {
+			return cliproxyauth.NewRequestScopedError("compaction_trigger is not supported by Antigravity models", http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 func (e *AntigravityExecutor) obfuscateSensitiveWords(payload []byte) []byte {
 	if e == nil || e.cfg == nil || len(e.cfg.Antigravity.SensitiveWords) == 0 {
 		return payload

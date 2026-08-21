@@ -27,6 +27,9 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	if errCompaction := antigravityUnsupportedCompactionTriggerError(req.Payload); errCompaction != nil {
+		return resp, errCompaction
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
 		return resp, homeKVUnavailableStatusErr(errCooldown)
