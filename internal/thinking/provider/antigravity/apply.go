@@ -50,6 +50,10 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		body = []byte(`{}`)
 	}
 
+	if strings.EqualFold(modelInfo.ID, "gemini-3.7-flash-high") && config.Level == thinking.LevelMinimal {
+		config.Level = thinking.LevelLow
+	}
+
 	isClaude := strings.Contains(strings.ToLower(modelInfo.ID), "claude")
 
 	// ModeAuto: Always use Budget format with thinkingBudget=-1

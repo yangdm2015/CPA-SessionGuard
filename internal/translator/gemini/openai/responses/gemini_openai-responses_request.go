@@ -376,6 +376,12 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	if re.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(re.String()))
 		if effort != "" {
+			switch effort {
+			case "minimal":
+				effort = "low"
+			case "xhigh", "ultra", "max":
+				effort = "high"
+			}
 			thinkingPath := "generationConfig.thinkingConfig"
 			if effort == "auto" {
 				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
