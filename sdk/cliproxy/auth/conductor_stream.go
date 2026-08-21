@@ -119,11 +119,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		defer close(out)
 		var failed bool
 		forward := true
+		responseTracker := &sessionAffinityResponseTracker{}
 		var rewriter *StreamRewriter
 		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
 			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
 		}
-		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+		var emit func(cliproxyexecutor.StreamChunk) bool
+		emit = func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := resultErrorFromError(chunk.Err)
@@ -151,7 +153,14 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			if len(chunk.Payload) == 0 {
 				return true
 			}
-			recordSessionAffinityResponseID(&opts, chunk.Payload, true)
+			if responseID := responseTracker.Observe(chunk.Payload); responseID != "" {
+				opts.EnsureMetadata()[cliproxyexecutor.SessionAffinityResponseIDMetadataKey] = responseID
+				if errBind := m.bindStrictSessionResponseID(auth.ID, provider, resultModel, responseID, opts); errBind != nil {
+					forwarded := emit(cliproxyexecutor.StreamChunk{Err: errBind})
+					forward = false
+					return forwarded
+				}
+			}
 			payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
 			if len(payload) == 0 {
 				return true
@@ -192,6 +201,20 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+}
+
+func (m *Manager) bindStrictSessionResponseID(authID, provider, model, responseID string, opts cliproxyexecutor.Options) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	affinity, ok := selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil {
+		return nil
+	}
+	return affinity.BindResponseID(authID, provider, model, responseID, opts)
 }
 
 func (m *Manager) replaceHomeExecutionLifecycleAuth(lifecycle cliproxyexecutor.ExecutionLifecycle, auth *Auth) {

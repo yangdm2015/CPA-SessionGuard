@@ -938,10 +938,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 }
 
 func (m *Manager) updateSessionAffinity(result Result) {
-	if m == nil || m.selector == nil {
+	if m == nil {
 		return
 	}
-	if affinity, ok := m.selector.(interface {
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	if affinity, ok := selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
 		affinity.OnResult(result)

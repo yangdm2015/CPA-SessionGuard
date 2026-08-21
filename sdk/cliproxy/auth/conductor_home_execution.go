@@ -10,6 +10,9 @@ import (
 )
 
 func (m *Manager) executeHome(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, countTokens bool) (cliproxyexecutor.Response, error) {
+	if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+		return cliproxyexecutor.Response{}, errStrict
+	}
 	if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 		defer unlockSession()
 	}

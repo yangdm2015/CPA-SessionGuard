@@ -3,11 +3,14 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -277,6 +280,103 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+}
+
+// ReconfigureSessionAffinitySelector replaces the routing wrapper while
+// retaining the cache that owns durable bindings.
+func (m *Manager) ReconfigureSessionAffinitySelector(fallback Selector, strict bool, ttl time.Duration) bool {
+	if m == nil {
+		return false
+	}
+	m.selectorMu.Lock()
+	defer m.selectorMu.Unlock()
+	m.mu.RLock()
+	affinity, ok := m.selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil {
+		m.mu.RUnlock()
+		return false
+	}
+	m.mu.RUnlock()
+	replacement, err := m.replaceSessionAffinitySelectorLocked(affinity, nil, fallback, strict, ttl)
+	if err != nil {
+		return false
+	}
+	if m.scheduler != nil {
+		m.scheduler.setSelector(replacement)
+		m.syncScheduler()
+	}
+	return true
+}
+
+func (m *Manager) MigrateAndReconfigureSessionAffinitySelector(store SessionBindingStore, fallback Selector, strict bool, ttl time.Duration) error {
+	if m == nil {
+		return fmt.Errorf("auth manager is unavailable")
+	}
+	m.selectorMu.Lock()
+	defer m.selectorMu.Unlock()
+	m.mu.RLock()
+	affinity, ok := m.selector.(*SessionAffinitySelector)
+	m.mu.RUnlock()
+	if !ok || affinity == nil {
+		return fmt.Errorf("session affinity selector is unavailable")
+	}
+	replacement, err := m.replaceSessionAffinitySelectorLocked(affinity, store, fallback, strict, ttl)
+	if err != nil {
+		return err
+	}
+	if m.scheduler != nil {
+		m.scheduler.setSelector(replacement)
+		m.syncScheduler()
+	}
+	return nil
+}
+
+func (m *Manager) replaceSessionAffinitySelectorLocked(affinity *SessionAffinitySelector, store SessionBindingStore, fallback Selector, strict bool, ttl time.Duration) (*SessionAffinitySelector, error) {
+	if affinity == nil || affinity.cache == nil {
+		return nil, fmt.Errorf("session affinity selector is unavailable")
+	}
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
+	affinity.mu.Lock()
+	if store != nil {
+		if err := affinity.cache.MigrateStore(store, strict); err != nil {
+			affinity.mu.Unlock()
+			return nil, err
+		}
+	} else {
+		affinity.cache.SetStrict(strict)
+	}
+	affinity.cache.SetTTL(ttl)
+	affinity.fallback = fallback
+	affinity.strict = strict
+	affinity.cache.retain()
+	replacement := &SessionAffinitySelector{fallback: fallback, cache: affinity.cache, strict: strict}
+	m.mu.Lock()
+	if m.selector != affinity {
+		m.mu.Unlock()
+		affinity.cache.release()
+		affinity.mu.Unlock()
+		return nil, fmt.Errorf("session affinity selector changed during reconfiguration")
+	}
+	m.selector = replacement
+	m.mu.Unlock()
+	affinity.mu.Unlock()
+	affinity.Stop()
+	return replacement, nil
+}
+
+func (m *Manager) MigrateSessionAffinityStore(store SessionBindingStore, strict bool) error {
+	if m == nil {
+		return fmt.Errorf("auth manager is unavailable")
+	}
+	m.mu.RLock()
+	affinity, ok := m.selector.(*SessionAffinitySelector)
+	m.mu.RUnlock()
+	if !ok || affinity == nil {
+		return fmt.Errorf("session affinity selector is unavailable")
+	}
+	return affinity.MigrateStore(store, strict)
 }
 
 // Selector returns the current credential selector.
@@ -851,6 +951,151 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	return *retryAfter, true
 }
 
+func (m *Manager) shouldRetryAfterRequestError(err error, attempt int, providers []string, model string, maxWait time.Duration, opts cliproxyexecutor.Options) (time.Duration, bool) {
+	authID, bound, strict, bindingErr := m.strictSessionAffinityState(model, opts)
+	if !strict {
+		return m.shouldRetryAfterError(err, attempt, providers, model, maxWait)
+	}
+	if bindingErr != nil || !bound {
+		if !isSessionAffinityStoreUnavailable(err) || maxWait <= 0 || !m.retryAllowed(attempt, providers) {
+			return 0, false
+		}
+		return strictSessionRetryDelay(attempt, maxWait), true
+	}
+	wait, retry := m.shouldRetryBoundSessionError(err, attempt, authID, model, maxWait)
+	if !retry {
+		return 0, false
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	affinity, ok := selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil || affinity.ExtendBinding(authID, "mixed", selectionArgForSelector(affinity, model), opts, wait) != nil {
+		return 0, false
+	}
+	return wait, true
+}
+
+func (m *Manager) strictSessionAffinityState(model string, opts cliproxyexecutor.Options) (authID string, bound, strict bool, err error) {
+	if m == nil {
+		return "", false, false, nil
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	affinity, ok := selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil {
+		return "", false, false, nil
+	}
+	return affinity.strictBindingAuthID("mixed", selectionArgForSelector(affinity, model), opts)
+}
+
+func (m *Manager) shouldRetryBoundSessionError(err error, attempt int, authID, model string, maxWait time.Duration) (time.Duration, bool) {
+	if err == nil || maxWait <= 0 || isRequestInvalidError(err) || isRequestStopError(err) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 0, false
+	}
+
+	now := time.Now()
+	m.mu.RLock()
+	auth := m.auths[authID]
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		m.mu.RUnlock()
+		return 0, false
+	}
+	effectiveRetry := int(m.requestRetry.Load())
+	if override, ok := auth.RequestRetryOverride(); ok {
+		effectiveRetry = override
+	}
+	if effectiveRetry < 0 || attempt >= effectiveRetry {
+		m.mu.RUnlock()
+		return 0, false
+	}
+	selectionModel := m.selectionModelForAuth(auth, model)
+	blocked, _, next := isAuthBlockedForModel(auth, selectionModel, now)
+	m.mu.RUnlock()
+
+	if blocked {
+		if next.IsZero() {
+			return 0, false
+		}
+		wait := next.Sub(now)
+		if wait < 0 {
+			wait = 0
+		}
+		if wait > maxWait {
+			wait = maxWait
+		}
+		return wait, true
+	}
+	if !isStrictSessionTransientError(err) {
+		return 0, false
+	}
+	if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > 0 {
+		if *retryAfter > maxWait {
+			return 0, false
+		}
+		return *retryAfter, true
+	}
+	return strictSessionRetryDelay(attempt, maxWait), true
+}
+
+func isStrictSessionTransientError(err error) bool {
+	status := statusCodeFromError(err)
+	switch status {
+	case http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	case 0:
+		var authErr *Error
+		if errors.As(err, &authErr) && authErr != nil && authErr.Retryable {
+			return true
+		}
+		return isConnectionLifecycleError(err) || isTransientNetworkError(err)
+	default:
+		return false
+	}
+}
+
+func isTransientNetworkError(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr != nil && dnsErr.IsNotFound {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr != nil {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ETIMEDOUT) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH)
+}
+
+func isSessionAffinityStoreUnavailable(err error) bool {
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "session_affinity_store_unavailable"
+}
+
+func strictSessionRetryDelay(attempt int, maxWait time.Duration) time.Duration {
+	delay := 250 * time.Millisecond
+	for i := 0; i < attempt && delay < 2*time.Second; i++ {
+		delay *= 2
+	}
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	if maxWait > 0 && delay > maxWait {
+		return maxWait
+	}
+	return delay
+}
+
 // cooldownWaitJitterCap bounds the random jitter added to cooldown waits so a
 // long wait is never extended by more than this amount.
 const cooldownWaitJitterCap = 2 * time.Second
@@ -997,7 +1242,10 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	return isBuiltInSelector(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1024,19 +1272,22 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(model, opts); errStrict != nil {
+			return nil, nil, errStrict
+		}
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
 
 	opts.EnsureMetadata()
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
-	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(m.selector, model)
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 
 	m.mu.RLock()
 	selector := m.selector
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
 	executor, okExecutor := m.executors[provider]
 	if !okExecutor {
@@ -1082,9 +1333,15 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
-	if errPick != nil {
-		return nil, nil, errPick
+	var selected *Auth
+	handled := false
+	var errPick error
+	_, affinityEnabled := selector.(*SessionAffinitySelector)
+	if !affinityEnabled {
+		selected, handled, errPick = m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
+		if errPick != nil {
+			return nil, nil, errPick
+		}
 	}
 	if !handled {
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
@@ -1277,6 +1534,9 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts.EnsureMetadata()
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(model, opts); errStrict != nil {
+			return nil, nil, errStrict
+		}
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
@@ -1335,12 +1595,14 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(model, opts); errStrict != nil {
+			return nil, nil, "", errStrict
+		}
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
 	opts.EnsureMetadata()
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
-	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(m.selector, model)
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -1359,6 +1621,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	m.mu.RLock()
 	selector := m.selector
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
 	candidates := make([]*Auth, 0, len(m.auths))
 	modelKey := strings.TrimSpace(model)
@@ -1409,9 +1672,15 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
-	if errPick != nil {
-		return nil, nil, "", errPick
+	var selected *Auth
+	handled := false
+	var errPick error
+	_, affinityEnabled := selector.(*SessionAffinitySelector)
+	if !affinityEnabled {
+		selected, handled, errPick = m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
+		if errPick != nil {
+			return nil, nil, "", errPick
+		}
 	}
 	if !handled {
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
@@ -1446,6 +1715,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(model, opts); errStrict != nil {
+			return nil, nil, "", errStrict
+		}
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"

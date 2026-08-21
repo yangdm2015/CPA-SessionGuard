@@ -42,6 +42,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return cliproxyexecutor.Response{}, errStrict
+		}
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapRequestStopError(errHome)
 	}
@@ -59,7 +62,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			return cliproxyexecutor.Response{}, unwrapRequestStopError(errExec)
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterRequestError(errExec, attempt, normalized, retryModel, maxWait, opts)
 		if !shouldRetry {
 			break
 		}
@@ -69,7 +72,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	if lastErr != nil {
 		lastErr = unwrapRequestStopError(lastErr)
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		_, _, strictSession, _ := m.strictSessionAffinityState(retryModel, opts)
+		if !strictSession && hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
 				return cliproxyexecutor.Response{}, errCredits
 			} else if ok {
@@ -89,6 +93,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return cliproxyexecutor.Response{}, errStrict
+		}
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, true)
 		return resp, unwrapRequestStopError(errHome)
 	}
@@ -106,7 +113,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			return cliproxyexecutor.Response{}, unwrapRequestStopError(errExec)
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterRequestError(errExec, attempt, normalized, retryModel, maxWait, opts)
 		if !shouldRetry {
 			break
 		}
@@ -125,6 +132,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return nil, errStrict
+		}
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
 		}
@@ -147,7 +157,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return nil, unwrapRequestStopError(errStream)
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterRequestError(errStream, attempt, normalized, retryModel, maxWait, opts)
 		if !shouldRetry {
 			break
 		}
@@ -157,7 +167,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 	if lastErr != nil {
 		lastErr = unwrapRequestStopError(lastErr)
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		_, _, strictSession, _ := m.strictSessionAffinityState(retryModel, opts)
+		if !strictSession && hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
 				return nil, errCredits
 			} else if ok {
@@ -171,6 +182,21 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func (m *Manager) rejectStrictSessionHome(model string, opts cliproxyexecutor.Options) error {
+	if m == nil {
+		return nil
+	}
+	_, _, strict, _ := m.strictSessionAffinityState(authSelectionModelFromOptions(opts, model), opts)
+	if !strict {
+		return nil
+	}
+	return &Error{
+		Code:       "strict_session_home_unsupported",
+		Message:    "strict session affinity cannot use Home dispatch because it may change credentials",
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
 }
 
 type requestToFormatResolver interface {
@@ -284,6 +310,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return cliproxyexecutor.Response{}, errStrict
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
@@ -374,6 +405,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			if errExec == nil {
 				recordSessionAffinityResponseID(&execOpts, resp.Payload, false)
+				if responseID, _ := execOpts.Metadata[cliproxyexecutor.SessionAffinityResponseIDMetadataKey].(string); responseID != "" {
+					if errBind := m.bindStrictSessionResponseID(auth.ID, provider, resultModel, responseID, execOpts); errBind != nil {
+						return cliproxyexecutor.Response{}, errBind
+					}
+				}
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Options: execOpts}
 			if errExec != nil {
@@ -443,6 +479,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return cliproxyexecutor.Response{}, errStrict
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
@@ -608,6 +649,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if errStrict := m.rejectStrictSessionHome(req.Model, opts); errStrict != nil {
+			return nil, errStrict
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})

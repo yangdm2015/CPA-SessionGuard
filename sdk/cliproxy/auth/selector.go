@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -610,6 +611,8 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with configurable failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
+	mu       sync.RWMutex
+	stopOnce sync.Once
 	fallback Selector
 	cache    *SessionCache
 	strict   bool
@@ -639,7 +642,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
-	cache, errStore := NewSessionCacheWithStore(cfg.TTL, cfg.Store)
+	cache, errStore := newSessionCacheWithStoreMode(cfg.TTL, cfg.Store, cfg.Strict)
 	if errStore != nil {
 		log.Errorf("failed to restore session affinity bindings: %v", errStore)
 	}
@@ -663,6 +666,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	s.mu.RLock()
+	fallback, strict := s.fallback, s.strict
+	defer s.mu.RUnlock()
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -672,7 +678,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
 	availabilityCandidates := auths
-	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
+	if _, weighted := fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
@@ -681,9 +687,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	}
-	if errStore := s.cache.StoreError(); errStore != nil {
+	if errStore := s.cache.EnsureStoreAvailable(); errStore != nil {
 		return nil, sessionAffinityStoreUnavailableError()
 	}
 
@@ -702,37 +708,89 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
 	bind := func(authID string) error {
+		if strict {
+			prefixes := []string{provider + "::" + primaryID + "::"}
+			if fallbackKey != "" {
+				prefixes = append(prefixes, provider+"::"+fallbackID+"::")
+				return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey, fallbackKey)
+			}
+			return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey)
+		}
 		if fallbackKey != "" {
 			return s.cache.BindAliases(authID, cacheKey, fallbackKey)
 		}
 		return s.cache.BindAliases(authID, cacheKey)
 	}
+	var strictSessionAuthID string
+	var strictSessionFound bool
+	if strict {
+		for _, sessionID := range []string{primaryID, fallbackID} {
+			if sessionID == "" {
+				continue
+			}
+			authID, found, errPrefix := s.cache.FindUniqueAuthByPrefix(provider + "::" + sessionID + "::")
+			if errPrefix != nil || (strictSessionFound && found && strictSessionAuthID != authID) {
+				return nil, strictSessionBindingConflictError()
+			}
+			if found {
+				strictSessionAuthID = authID
+				strictSessionFound = true
+			}
+		}
+	}
 
-	if cachedAuthID, ok, errCache := s.cache.GetAndRefreshPersistent(cacheKey); errCache != nil {
+	var cachedAuthID string
+	var cached bool
+	var errCache error
+	if strict {
+		cachedAuthID, cached, errCache = s.cache.GetPersistent(cacheKey)
+	} else {
+		cachedAuthID, cached, errCache = s.cache.GetAndRefreshPersistent(cacheKey)
+	}
+	if errCache != nil {
 		return nil, sessionAffinityStoreUnavailableError()
-	} else if ok {
+	} else if cached {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
-				if errBind := bind(auth.ID); errBind != nil {
-					return nil, sessionAffinityStoreUnavailableError()
+				aliasesReady := fallbackKey == ""
+				if !aliasesReady {
+					fallbackAuthID, fallbackFound := s.cache.Get(fallbackKey)
+					aliasesReady = fallbackFound && fallbackAuthID == auth.ID
+				}
+				if !aliasesReady {
+					if errBind := bind(auth.ID); errBind != nil {
+						return nil, sessionAffinityBindError(errBind)
+					}
 				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		if s.strict {
+		if strict {
 			return nil, strictSessionAuthUnavailableError()
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		auth, err := fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
 		if errBind := bind(auth.ID); errBind != nil {
-			return nil, sessionAffinityStoreUnavailableError()
+			return nil, sessionAffinityBindError(errBind)
 		}
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
+	}
+	if strictSessionFound {
+		for _, auth := range available {
+			if auth.ID == strictSessionAuthID {
+				if errBind := bind(auth.ID); errBind != nil {
+					return nil, sessionAffinityBindError(errBind)
+				}
+				entry.Infof("session-affinity: cross-model cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+				return auth, nil
+			}
+		}
+		return nil, strictSessionAuthUnavailableError()
 	}
 
 	if fallbackKey != "" {
@@ -740,27 +798,131 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					if errBind := bind(auth.ID); errBind != nil {
-						return nil, sessionAffinityStoreUnavailableError()
+						return nil, sessionAffinityBindError(errBind)
 					}
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
 			}
-			if s.strict {
+			if strict {
 				return nil, strictSessionAuthUnavailableError()
 			}
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
 	if errBind := bind(auth.ID); errBind != nil {
-		return nil, sessionAffinityStoreUnavailableError()
+		return nil, sessionAffinityBindError(errBind)
 	}
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) strictBindingAuthID(provider, model string, opts cliproxyexecutor.Options) (string, bool, bool, error) {
+	if s == nil || s.cache == nil {
+		return "", false, false, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.strict {
+		return "", false, false, nil
+	}
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" && fallbackID == "" {
+		return "", false, false, nil
+	}
+	if err := s.cache.EnsureStoreAvailable(); err != nil {
+		return "", false, true, err
+	}
+	for _, sessionID := range []string{primaryID, fallbackID} {
+		if sessionID == "" {
+			continue
+		}
+		if authID, ok := s.cache.Get(SessionBindingKey(provider, sessionID, model)); ok {
+			return authID, true, true, nil
+		}
+	}
+	for _, sessionID := range []string{primaryID, fallbackID} {
+		if sessionID == "" {
+			continue
+		}
+		authID, ok, err := s.cache.FindUniqueAuthByPrefix(provider + "::" + sessionID + "::")
+		if err != nil || ok {
+			return authID, ok, true, err
+		}
+	}
+	return "", false, true, nil
+}
+
+func (s *SessionAffinitySelector) routingSnapshot() (Selector, bool) {
+	if s == nil {
+		return &RoundRobinSelector{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fallback, s.strict
+}
+
+func (s *SessionAffinitySelector) isStrict() bool {
+	_, strict := s.routingSnapshot()
+	return strict
+}
+
+// Reconfigured creates a new routing wrapper while sharing the cache that owns
+// durable session bindings.
+func (s *SessionAffinitySelector) Reconfigured(fallback Selector, strict bool, ttl time.Duration) *SessionAffinitySelector {
+	if s == nil {
+		return nil
+	}
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
+	if s.cache != nil {
+		s.cache.SetTTL(ttl)
+		s.cache.SetStrict(strict)
+		s.cache.retain()
+	}
+	return &SessionAffinitySelector{fallback: fallback, cache: s.cache, strict: strict}
+}
+
+func (s *SessionAffinitySelector) ReconfigureInPlace(fallback Selector, strict bool, ttl time.Duration) error {
+	return s.reconfigureInPlace(fallback, strict, ttl, nil)
+}
+
+func (s *SessionAffinitySelector) MigrateAndReconfigure(store SessionBindingStore, fallback Selector, strict bool, ttl time.Duration) error {
+	return s.reconfigureInPlace(fallback, strict, ttl, store)
+}
+
+func (s *SessionAffinitySelector) reconfigureInPlace(fallback Selector, strict bool, ttl time.Duration, store SessionBindingStore) error {
+	if s == nil || s.cache == nil {
+		return fmt.Errorf("session affinity cache is unavailable")
+	}
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if store != nil {
+		if err := s.cache.MigrateStore(store, strict); err != nil {
+			return err
+		}
+	} else {
+		s.cache.SetStrict(strict)
+	}
+	s.cache.SetTTL(ttl)
+	s.fallback = fallback
+	s.strict = strict
+	return nil
+}
+
+func (s *SessionAffinitySelector) MigrateStore(store SessionBindingStore, strict bool) error {
+	if s == nil || s.cache == nil {
+		return fmt.Errorf("session affinity cache is unavailable")
+	}
+	return s.cache.MigrateStore(store, strict)
 }
 
 func strictSessionAuthUnavailableError() *Error {
@@ -770,6 +932,22 @@ func strictSessionAuthUnavailableError() *Error {
 		Retryable:  true,
 		HTTPStatus: http.StatusServiceUnavailable,
 	}
+}
+
+func strictSessionBindingConflictError() *Error {
+	return &Error{
+		Code:       "session_binding_conflict",
+		Message:    "session is bound to multiple credentials",
+		HTTPStatus: http.StatusServiceUnavailable,
+		Retryable:  true,
+	}
+}
+
+func sessionAffinityBindError(err error) error {
+	if errors.Is(err, errSessionBindingConflict) {
+		return strictSessionBindingConflictError()
+	}
+	return sessionAffinityStoreUnavailableError()
 }
 
 func sessionAffinityStoreUnavailableError() *Error {
@@ -801,15 +979,25 @@ func truncateSessionID(id string) string {
 
 // Stop releases resources held by the selector.
 func (s *SessionAffinitySelector) Stop() {
-	if s.cache != nil {
-		s.cache.Stop()
+	if s == nil {
+		return
 	}
+	s.stopOnce.Do(func() {
+		if s.cache != nil {
+			s.cache.release()
+		}
+	})
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
 // Called when an auth becomes rate-limited or unavailable.
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
-	if s.cache != nil && !s.strict {
+	if s == nil || s.cache == nil {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.strict {
 		s.cache.InvalidateAuth(authID)
 	}
 }
@@ -819,6 +1007,8 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
 		return
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
 	if primaryID == "" && fallbackID == "" {
 		return
@@ -839,6 +1029,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
+		if s.strict {
+			return
+		}
 		aliases := []string{cacheKey}
 		if fallbackKey != "" {
 			aliases = append(aliases, fallbackKey)
@@ -872,6 +1065,74 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if errPersist != nil {
 		log.Errorf("failed to persist session affinity release: %v", errPersist)
 	}
+}
+
+// BindResponseID persists a continuation ID before a strict streaming response
+// exposes it to the client.
+func (s *SessionAffinitySelector) BindResponseID(authID, provider, model, responseID string, opts cliproxyexecutor.Options) error {
+	if s == nil || s.cache == nil || authID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.strict {
+		return nil
+	}
+	responseID = normalizedSessionCandidate(responseID)
+	if responseID == "" {
+		return nil
+	}
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		return strictSessionBindingConflictError()
+	}
+	ns := provider
+	if raw, ok := opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
+		ns = raw
+	}
+	nsModel := canonicalModelKey(model)
+	if raw, ok := opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
+		nsModel = canonicalModelKey(raw)
+	}
+	cacheKey := SessionBindingKey(ns, primaryID, nsModel)
+	aliases := []string{cacheKey, SessionBindingKey(ns, "response:"+responseID, nsModel)}
+	if fallbackID != "" && fallbackID != primaryID {
+		aliases = append(aliases, SessionBindingKey(ns, fallbackID, nsModel))
+	}
+	matched, err := s.cache.BindAliasesIfMatch(cacheKey, authID, aliases...)
+	if err != nil {
+		return sessionAffinityBindError(err)
+	}
+	if !matched {
+		return strictSessionBindingConflictError()
+	}
+	return nil
+}
+
+func (s *SessionAffinitySelector) ExtendBinding(authID, provider, model string, opts cliproxyexecutor.Options, wait time.Duration) error {
+	if s == nil || s.cache == nil || authID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.strict {
+		return nil
+	}
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	for _, sessionID := range []string{primaryID, fallbackID} {
+		if sessionID == "" {
+			continue
+		}
+		key := SessionBindingKey(provider, sessionID, model)
+		matched, err := s.cache.TouchPersistentFor(key, authID, wait+s.cache.ttlDuration())
+		if err != nil {
+			return sessionAffinityBindError(err)
+		}
+		if matched {
+			return nil
+		}
+	}
+	return strictSessionBindingConflictError()
 }
 
 // normalizedSessionCandidate validates an explicit client-provided session signal.
@@ -947,7 +1208,6 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	if sid := sessionHeaderValue(headers, "X-Client-Request-Id"); sid != "" {
 		return "clientreq:" + sid, ""
 	}
-
 	if len(payload) > 0 {
 		for _, path := range []string{"session_id", "sessionId"} {
 			if sid := normalizedSessionCandidate(gjson.GetBytes(payload, path).String()); sid != "" {

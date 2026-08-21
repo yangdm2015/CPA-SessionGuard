@@ -710,13 +710,18 @@ func (s *Service) runHomeConfigWorkerWithSupervisor(lifetimeCtx, homeCtx context
 		if s.homeConfigStageHook != nil {
 			s.homeConfigStageHook()
 		}
-		if !s.commitHomeConfig(lifetimeCtx, homeCtx, generation, work) {
-			return
-		}
-		if s.homeConfigRuntimeHook != nil {
-			s.homeConfigRuntimeHook()
-		}
-		if !s.homeLifetimeActive(homeCtx, lifetimeCtx, generation) || !s.applyConfigRuntime(lifetimeCtx, work.configCommit, true) {
+		applied := func() bool {
+			s.configTransitionMu.Lock()
+			defer s.configTransitionMu.Unlock()
+			if !s.commitHomeConfig(lifetimeCtx, homeCtx, generation, work) {
+				return false
+			}
+			if s.homeConfigRuntimeHook != nil {
+				s.homeConfigRuntimeHook()
+			}
+			return s.homeLifetimeActive(homeCtx, lifetimeCtx, generation) && s.applyConfigRuntime(lifetimeCtx, work.configCommit, true)
+		}()
+		if !applied {
 			return
 		}
 		if errFinalize := s.finalizeHomePluginWorkUntilDone(lifetimeCtx, homeCtx, generation, client, work, publish); errFinalize != nil {

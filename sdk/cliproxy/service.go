@@ -36,6 +36,7 @@ type Service struct {
 	configUpdateMu sync.Mutex
 
 	// configRuntimeMu orders side-effecting runtime application after config commits.
+	configTransitionMu     sync.Mutex
 	configRuntimeMu        sync.Mutex
 	executorRegistrationMu sync.Mutex
 	configSequence         uint64

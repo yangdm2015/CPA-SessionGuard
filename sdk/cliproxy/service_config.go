@@ -21,8 +21,9 @@ func (s *Service) applyWatcherConfigUpdate(newCfg *config.Config) {
 }
 
 type configCommit struct {
-	cfg      *config.Config
-	sequence uint64
+	cfg                  *config.Config
+	sequence             uint64
+	sessionStoreMigrated bool
 }
 
 type routingRuntimeState struct {
@@ -51,7 +52,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	state.sessionAffinityStrict = cfg.Routing.SessionAffinityStrict
-	state.sessionAffinityPersist = cfg.Routing.SessionAffinityPersist
+	state.sessionAffinityPersist = cfg.Routing.SessionAffinityPersist ||
+		(state.sessionAffinity && state.sessionAffinityStrict)
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
 			state.sessionAffinityTTL = parsed
@@ -66,7 +68,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+func newBaseRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
@@ -76,6 +78,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
+	return selector
+}
+
+func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+	selector := newBaseRoutingSelector(state)
 	if state.sessionAffinity {
 		var store coreauth.SessionBindingStore
 		if state.sessionAffinityPersist {
@@ -91,11 +98,55 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	return selector
 }
 
+func canReuseSessionAffinityCache(previous *routingRuntimeState, next routingRuntimeState) bool {
+	return previous != nil && previous.sessionAffinity && next.sessionAffinity &&
+		previous.sessionAffinityPersist == next.sessionAffinityPersist &&
+		previous.sessionAffinityStorePath == next.sessionAffinityStorePath
+}
+
+func requiresSessionAffinityStoreMigration(previous *routingRuntimeState, next routingRuntimeState) bool {
+	return previous != nil && previous.sessionAffinity && next.sessionAffinity && next.sessionAffinityStrict &&
+		(!previous.sessionAffinityStrict || previous.sessionAffinityPersist != next.sessionAffinityPersist ||
+			previous.sessionAffinityStorePath != next.sessionAffinityStorePath)
+}
+
 func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg *config.Config, synthesizeConfigAuths bool) bool {
+	if s == nil {
+		return false
+	}
+	s.configTransitionMu.Lock()
+	defer s.configTransitionMu.Unlock()
+	if newCfg == nil {
+		s.cfgMu.RLock()
+		newCfg = s.cfg
+		s.cfgMu.RUnlock()
+	}
+	if newCfg == nil || newCfg.ValidateCredentialWeights() != nil {
+		return false
+	}
+	nextRoutingState := normalizedRoutingRuntimeState(newCfg)
+	migrated := false
+	if requiresSessionAffinityStoreMigration(s.appliedRoutingState, nextRoutingState) {
+		if s.coreManager == nil {
+			return false
+		}
+		store := coreauth.NewFileSessionBindingStore(nextRoutingState.sessionAffinityStorePath)
+		if errMigrate := s.coreManager.MigrateAndReconfigureSessionAffinitySelector(
+			store,
+			newBaseRoutingSelector(nextRoutingState),
+			nextRoutingState.sessionAffinityStrict,
+			nextRoutingState.sessionAffinityTTL,
+		); errMigrate != nil {
+			log.Errorf("failed to migrate strict session affinity store before config commit: %v", errMigrate)
+			return false
+		}
+		migrated = true
+	}
 	commit := s.commitConfigUpdate(newCfg)
 	if commit.cfg == nil {
 		return false
 	}
+	commit.sessionStoreMigrated = migrated
 	return s.applyConfigRuntime(ctx, commit, synthesizeConfigAuths)
 }
 
@@ -222,7 +273,37 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+		reused := false
+		if requiresSessionAffinityStoreMigration(s.appliedRoutingState, routingState) {
+			if !commit.sessionStoreMigrated {
+				store := coreauth.NewFileSessionBindingStore(routingState.sessionAffinityStorePath)
+				if errMigrate := s.coreManager.MigrateAndReconfigureSessionAffinitySelector(
+					store,
+					newBaseRoutingSelector(routingState),
+					routingState.sessionAffinityStrict,
+					routingState.sessionAffinityTTL,
+				); errMigrate != nil {
+					log.Errorf("failed to migrate strict session affinity store: %v", errMigrate)
+					return false
+				}
+			}
+			reused = commit.sessionStoreMigrated || s.coreManager.ReconfigureSessionAffinitySelector(
+				newBaseRoutingSelector(routingState), routingState.sessionAffinityStrict, routingState.sessionAffinityTTL)
+			if !reused {
+				log.Error("failed to reconfigure strict session affinity selector after store migration")
+				return false
+			}
+		}
+		if canReuseSessionAffinityCache(s.appliedRoutingState, routingState) {
+			reused = reused || s.coreManager.ReconfigureSessionAffinitySelector(
+				newBaseRoutingSelector(routingState),
+				routingState.sessionAffinityStrict,
+				routingState.sessionAffinityTTL,
+			)
+		}
+		if !reused {
+			s.coreManager.SetSelector(newRoutingSelector(routingState))
+		}
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
