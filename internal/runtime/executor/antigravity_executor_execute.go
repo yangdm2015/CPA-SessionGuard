@@ -150,32 +150,32 @@ attemptLoop:
 			helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 
 			if httpResp.StatusCode == http.StatusTooManyRequests {
+				if attempt < 2 && attempt+1 < attempts {
+					wait := 10 * time.Second
+					if attempt == 1 {
+						wait = 20 * time.Second
+					}
+					log.Infof("antigravity executor: 429 rate limit encountered for model %s, waiting %s on same auth (attempt %d/2)", baseModel, wait, attempt+1)
+					if errWait := antigravityWait(ctx, wait); errWait != nil {
+						return resp, errWait
+					}
+					continue attemptLoop
+				}
+
 				decision := decideAntigravity429(bodyBytes)
 				switch decision.kind {
-				case antigravity429DecisionInstantRetrySameAuth:
-					if attempt+1 < attempts {
-						if decision.retryAfter != nil && *decision.retryAfter > 0 {
-							wait := antigravityInstantRetryDelay(*decision.retryAfter)
-							log.Debugf("antigravity executor: instant retry for model %s, waiting %s", baseModel, wait)
-							if errWait := antigravityWait(ctx, wait); errWait != nil {
-								return resp, errWait
-							}
-						}
-						continue attemptLoop
-					}
-				case antigravity429DecisionShortCooldownSwitchAuth:
+				case antigravity429DecisionShortCooldownSwitchAuth, antigravity429DecisionInstantRetrySameAuth, antigravity429DecisionSoftRetry:
 					if decision.retryAfter != nil && *decision.retryAfter > 0 {
 						if errMarkCooldown := markAntigravityShortCooldownRequired(ctx, auth, baseModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
 							err = homeKVUnavailableStatusErr(errMarkCooldown)
 							return resp, err
 						}
-						log.Debugf("antigravity executor: short quota cooldown (%s) for model %s, recorded cooldown", *decision.retryAfter, baseModel)
+						log.Infof("antigravity executor: 429 persisted after 2 retries, short quota cooldown (%s) for model %s recorded", *decision.retryAfter, baseModel)
 					}
 				case antigravity429DecisionFullQuotaExhausted:
 					if useCredits && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
 						markAntigravityCreditsPermanentlyDisabled(auth)
 					}
-					// No credits logic - just fall through to error return below
 				}
 			}
 
@@ -390,33 +390,32 @@ attemptLoop:
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 				if httpResp.StatusCode == http.StatusTooManyRequests {
-					decision := decideAntigravity429(bodyBytes)
-
-					switch decision.kind {
-					case antigravity429DecisionInstantRetrySameAuth:
-						if attempt+1 < attempts {
-							if decision.retryAfter != nil && *decision.retryAfter > 0 {
-								wait := antigravityInstantRetryDelay(*decision.retryAfter)
-								log.Debugf("antigravity executor: instant retry for model %s, waiting %s", baseModel, wait)
-								if errWait := antigravityWait(ctx, wait); errWait != nil {
-									return resp, errWait
-								}
-							}
-							continue attemptLoop
+					if attempt < 2 && attempt+1 < attempts {
+						wait := 10 * time.Second
+						if attempt == 1 {
+							wait = 20 * time.Second
 						}
-					case antigravity429DecisionShortCooldownSwitchAuth:
+						log.Infof("antigravity executor: 429 rate limit encountered for model %s, waiting %s on same auth (attempt %d/2)", baseModel, wait, attempt+1)
+						if errWait := antigravityWait(ctx, wait); errWait != nil {
+							return resp, errWait
+						}
+						continue attemptLoop
+					}
+
+					decision := decideAntigravity429(bodyBytes)
+					switch decision.kind {
+					case antigravity429DecisionShortCooldownSwitchAuth, antigravity429DecisionInstantRetrySameAuth, antigravity429DecisionSoftRetry:
 						if decision.retryAfter != nil && *decision.retryAfter > 0 {
 							if errMarkCooldown := markAntigravityShortCooldownRequired(ctx, auth, baseModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
 								err = homeKVUnavailableStatusErr(errMarkCooldown)
 								return resp, err
 							}
-							log.Debugf("antigravity executor: short quota cooldown (%s) for model %s, recorded cooldown", *decision.retryAfter, baseModel)
+							log.Infof("antigravity executor: 429 persisted after 2 retries, short quota cooldown (%s) for model %s recorded", *decision.retryAfter, baseModel)
 						}
 					case antigravity429DecisionFullQuotaExhausted:
 						if useCredits && antigravityHasExplicitCreditsBalanceExhaustedReason(bodyBytes) {
 							markAntigravityCreditsPermanentlyDisabled(auth)
 						}
-						// No credits logic - just fall through to error return below
 					}
 				}
 

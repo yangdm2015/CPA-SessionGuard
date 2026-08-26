@@ -718,6 +718,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		if snapshot, observed := codexWeeklyQuotaObservation(result.Options, result.AuthID); observed {
+			auth.observeCodexWeeklyQuota(snapshot.remainingPercent, snapshot.resetAt)
+		}
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {

@@ -619,6 +619,48 @@ func isGeminiOrAntigravity(provider, model string) bool {
 	return false
 }
 
+func authCapacityScore(auth *Auth, model string, now time.Time) float64 {
+	if auth == nil {
+		return -1
+	}
+	score := 10000.0 * float64(authPriority(auth))
+	if weight := authWeight(auth); weight > 0 {
+		score += float64(weight) * 1000.0
+	}
+	if hint, ok := GetAntigravityCreditsHint(auth.ID); ok && hint.Available && hint.CreditAmount > 0 {
+		score += hint.CreditAmount * 100.0
+	}
+	recentCount := 0
+	currentBucketID := recentRequestBucketID(now)
+	for i := 0; i < 5; i++ {
+		bucketID := currentBucketID - int64(i)
+		idx := recentRequestBucketIndex(bucketID)
+		bucket := auth.recentRequests.buckets[idx]
+		if bucket.bucketID == bucketID {
+			recentCount += int(bucket.success + bucket.failed)
+		}
+	}
+	score -= float64(recentCount) * 10.0
+	return score
+}
+
+func pickGeminiHighestCapacityAuth(candidates []*Auth, model string) *Auth {
+	if len(candidates) == 0 {
+		return nil
+	}
+	now := time.Now()
+	var best *Auth
+	var bestScore float64
+	for i, a := range candidates {
+		score := authCapacityScore(a, model, now)
+		if i == 0 || score > bestScore {
+			best = a
+			bestScore = score
+		}
+	}
+	return best
+}
+
 // SessionAffinitySelector wraps another selector with session-sticky behavior.
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with configurable failover when the bound auth becomes unavailable.
@@ -782,7 +824,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, strictSessionAuthUnavailableError()
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		var auth *Auth
+		if isGeminiOrAntigravity(provider, model) {
+			auth = pickGeminiHighestCapacityAuth(fallbackAuths, model)
+			if auth == nil {
+				err = &Error{Code: "auth_unavailable", Message: "no available auth for gemini"}
+			}
+		} else {
+			auth, err = fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -822,7 +872,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	coldBindingAuths := highestPriorityAuths(codexColdBindingCandidates(available, now))
+	var auth *Auth
+	if isGeminiOrAntigravity(provider, model) {
+		auth = pickGeminiHighestCapacityAuth(fallbackAuths, model)
+		if auth == nil {
+			err = &Error{Code: "auth_unavailable", Message: "no available auth for gemini"}
+		}
+	} else {
+		auth, err = fallback.Pick(ctx, provider, model, opts, coldBindingAuths)
+	}
 	if err != nil {
 		return nil, err
 	}

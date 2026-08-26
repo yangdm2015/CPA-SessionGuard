@@ -114,7 +114,7 @@ func openGeniusRequest(ctx context.Context, cfg pluginConfig, req pluginapi.Exec
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	return sharedGeniusChannel.Open(ctx, prepared, directGeniusTransport{client: client}, false)
+	return openGeniusWithReasoningRecovery(ctx, prepared, directGeniusTransport{client: client}, false)
 }
 
 func openGeniusExecutorRequest(ctx context.Context, cfg pluginConfig, req rpcExecutorRequest, stream bool) (*http.Response, error) {
@@ -123,9 +123,9 @@ func openGeniusExecutorRequest(ctx context.Context, cfg pluginConfig, req rpcExe
 		return nil, errPrepare
 	}
 	if strings.TrimSpace(req.HostCallbackID) == "" {
-		return sharedGeniusChannel.Open(ctx, prepared, directGeniusTransport{client: http.DefaultClient}, false)
+		return openGeniusWithReasoningRecovery(ctx, prepared, directGeniusTransport{client: http.DefaultClient}, false)
 	}
-	return sharedGeniusChannel.Open(ctx, prepared, hostGeniusTransport{stream: stream}, true)
+	return openGeniusWithReasoningRecovery(ctx, prepared, hostGeniusTransport{stream: stream}, true)
 }
 
 func prepareGeniusRequest(cfg pluginConfig, req pluginapi.ExecutorRequest, callbackID string) (geniusPreparedRequest, error) {
