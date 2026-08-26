@@ -203,6 +203,14 @@ func cloneResponseHeaders(headers http.Header) http.Header {
 }
 
 func warmErrorMessage(body []byte) string {
+	return upstreamErrorMessage(body, "Trae Warm upstream request failed")
+}
+
+func geniusErrorMessage(body []byte) string {
+	return upstreamErrorMessage(body, "Genius ModelHub upstream request failed")
+}
+
+func upstreamErrorMessage(body []byte, fallback string) string {
 	var payload struct {
 		Error struct {
 			Message string `json:"message"`
@@ -217,5 +225,5 @@ func warmErrorMessage(body []byte) string {
 			return payload.Error.Type
 		}
 	}
-	return "Trae Warm upstream request failed"
+	return fallback
 }

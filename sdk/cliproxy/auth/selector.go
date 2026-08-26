@@ -607,6 +607,18 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 	return true, blockReasonOther, time.Time{}
 }
 
+func isGeminiOrAntigravity(provider, model string) bool {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	if p == "antigravity" || p == "gemini" || p == "aistudio" || p == "vertex" {
+		return true
+	}
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(m, "gemini") || strings.HasPrefix(m, "antigravity") {
+		return true
+	}
+	return false
+}
+
 // SessionAffinitySelector wraps another selector with session-sticky behavior.
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with configurable failover when the bound auth becomes unavailable.
@@ -681,12 +693,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if _, weighted := fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
-	if primaryID == "" {
+	if isGeminiOrAntigravity(provider, model) || primaryID == "" {
 		fallbackAuths, errAvailable := getAvailableAuths(availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
-		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		if isGeminiOrAntigravity(provider, model) {
+			entry.Debugf("session-affinity: disabled for gemini/antigravity (load balancing based on available capacity) | provider=%s model=%s", provider, model)
+		} else {
+			entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		}
 		return fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	}
 	if errStore := s.cache.EnsureStoreAvailable(); errStore != nil {
@@ -822,7 +838,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 }
 
 func (s *SessionAffinitySelector) strictBindingAuthID(provider, model string, opts cliproxyexecutor.Options) (string, bool, bool, error) {
-	if s == nil || s.cache == nil {
+	if s == nil || s.cache == nil || isGeminiOrAntigravity(provider, model) {
 		return "", false, false, nil
 	}
 	s.mu.RLock()
@@ -1022,6 +1038,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
 		nsModel = canonicalModelKey(raw)
 	}
+	if isGeminiOrAntigravity(ns, nsModel) {
+		return
+	}
 
 	cacheKey := ns + "::" + primaryID + "::" + nsModel
 	var fallbackKey string
@@ -1094,6 +1113,9 @@ func (s *SessionAffinitySelector) BindResponseID(authID, provider, model, respon
 	if raw, ok := opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
 		nsModel = canonicalModelKey(raw)
 	}
+	if isGeminiOrAntigravity(ns, nsModel) {
+		return nil
+	}
 	cacheKey := SessionBindingKey(ns, primaryID, nsModel)
 	aliases := []string{cacheKey, SessionBindingKey(ns, "response:"+responseID, nsModel)}
 	if fallbackID != "" && fallbackID != primaryID {
@@ -1110,7 +1132,7 @@ func (s *SessionAffinitySelector) BindResponseID(authID, provider, model, respon
 }
 
 func (s *SessionAffinitySelector) ExtendBinding(authID, provider, model string, opts cliproxyexecutor.Options, wait time.Duration) error {
-	if s == nil || s.cache == nil || authID == "" {
+	if s == nil || s.cache == nil || authID == "" || isGeminiOrAntigravity(provider, model) {
 		return nil
 	}
 	s.mu.RLock()

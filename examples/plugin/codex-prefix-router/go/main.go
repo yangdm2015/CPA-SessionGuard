@@ -89,16 +89,21 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	SuperPrefix       string `yaml:"super_prefix"`
-	SuperProvider     string `yaml:"super_provider"`
-	TraePrefix        string `yaml:"trae_prefix"`
-	TraeProvider      string `yaml:"trae_provider"`
-	TraeWarmPrefix    string `yaml:"trae_warm_prefix"`
-	TraeWarmProvider  string `yaml:"trae_warm_provider"`
-	TraeWarmModel     string `yaml:"trae_warm_model"`
-	TraeWarmSelfRoute bool   `yaml:"trae_warm_self_route"`
-	TraeWarmUpstream  string `yaml:"trae_warm_upstream"`
+	Enabled            bool   `yaml:"enabled"`
+	SuperPrefix        string `yaml:"super_prefix"`
+	SuperProvider      string `yaml:"super_provider"`
+	TraePrefix         string `yaml:"trae_prefix"`
+	TraeProvider       string `yaml:"trae_provider"`
+	TraeWarmPrefix     string `yaml:"trae_warm_prefix"`
+	TraeWarmProvider   string `yaml:"trae_warm_provider"`
+	TraeWarmModel      string `yaml:"trae_warm_model"`
+	TraeWarmSelfRoute  bool   `yaml:"trae_warm_self_route"`
+	TraeWarmUpstream   string `yaml:"trae_warm_upstream"`
+	GeniusPrefix       string `yaml:"genius_prefix"`
+	GeniusModel        string `yaml:"genius_model"`
+	GeniusSelfRoute    bool   `yaml:"genius_self_route"`
+	GeniusResponsesURL string `yaml:"genius_responses_url"`
+	GeniusAPIKeyEnv    string `yaml:"genius_api_key_env"`
 }
 
 type registration struct {
@@ -186,8 +191,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": pluginIdentifier})
 	case pluginabi.MethodExecutorExecute:
+		if isGeniusRequest(request) {
+			return executeGenius(request)
+		}
 		return executeWarm(request)
 	case pluginabi.MethodExecutorExecuteStream:
+		if isGeniusRequest(request) {
+			return executeGeniusStream(request)
+		}
 		return executeWarmStream(request)
 	case pluginabi.MethodExecutorCountTokens:
 		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
@@ -217,14 +228,18 @@ func configure(raw []byte) error {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:          true,
-		SuperPrefix:      "super/",
-		SuperProvider:    "codex",
-		TraePrefix:       "trae/",
-		TraeWarmPrefix:   "trae-warm/",
-		TraeWarmProvider: "codex",
-		TraeWarmModel:    "GPT-5.6-Sol",
-		TraeWarmUpstream: "http://127.0.0.1:18091/v1",
+		Enabled:            true,
+		SuperPrefix:        "super/",
+		SuperProvider:      "codex",
+		TraePrefix:         "trae/",
+		TraeWarmPrefix:     "trae-warm/",
+		TraeWarmProvider:   "codex",
+		TraeWarmModel:      "GPT-5.6-Sol",
+		TraeWarmUpstream:   "http://127.0.0.1:18091/v1",
+		GeniusPrefix:       "genius/",
+		GeniusModel:        "gpt-5.6-sol",
+		GeniusResponsesURL: "https://search.bytedance.net/gpt/openapi/online/responses",
+		GeniusAPIKeyEnv:    "GENIUS_MODELHUB_AK",
 	}
 }
 
@@ -241,6 +256,10 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	cfg.TraeWarmProvider = strings.ToLower(strings.TrimSpace(cfg.TraeWarmProvider))
 	cfg.TraeWarmModel = strings.TrimSpace(cfg.TraeWarmModel)
 	cfg.TraeWarmUpstream = strings.TrimRight(strings.TrimSpace(cfg.TraeWarmUpstream), "/")
+	cfg.GeniusPrefix = normalizePrefix(cfg.GeniusPrefix)
+	cfg.GeniusModel = strings.TrimSpace(cfg.GeniusModel)
+	cfg.GeniusResponsesURL = strings.TrimSpace(cfg.GeniusResponsesURL)
+	cfg.GeniusAPIKeyEnv = strings.TrimSpace(cfg.GeniusAPIKeyEnv)
 	return cfg, nil
 }
 
@@ -257,7 +276,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.3.0",
+			Version:          "0.5.0",
 			Author:           "router-for-me",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
@@ -270,6 +289,11 @@ func pluginRegistration() registration {
 				{Name: "trae_warm_provider", Type: pluginapi.ConfigFieldTypeString, Description: "CPA provider key used when Trae Warm self route is disabled."},
 				{Name: "trae_warm_self_route", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Route Trae Warm requests to this plugin executor."},
 				{Name: "trae_warm_upstream", Type: pluginapi.ConfigFieldTypeString, Description: "Loopback base URL of the Trae Warm runtime."},
+				{Name: "genius_prefix", Type: pluginapi.ConfigFieldTypeString, Description: "Client-visible Genius ModelHub model prefix."},
+				{Name: "genius_model", Type: pluginapi.ConfigFieldTypeString, Description: "ModelHub model served by the Genius self route."},
+				{Name: "genius_self_route", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Route Genius ModelHub requests to this plugin executor."},
+				{Name: "genius_responses_url", Type: pluginapi.ConfigFieldTypeString, Description: "Genius ModelHub Responses API URL."},
+				{Name: "genius_api_key_env", Type: pluginapi.ConfigFieldTypeString, Description: "Environment variable containing the Genius ModelHub API key."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -295,6 +319,13 @@ func routePrefix(cfg pluginConfig, req pluginapi.ModelRouteRequest) pluginapi.Mo
 		return pluginapi.ModelRouteResponse{Handled: false, Reason: "codex_prefix_router_disabled"}
 	}
 	model := strings.TrimSpace(req.RequestedModel)
+	if cfg.GeniusSelfRoute && cfg.GeniusPrefix != "" && strings.HasPrefix(model, cfg.GeniusPrefix) {
+		targetModel := strings.TrimPrefix(model, cfg.GeniusPrefix)
+		if cfg.GeniusModel != "" && targetModel != cfg.GeniusModel {
+			return pluginapi.ModelRouteResponse{Handled: false, Reason: "genius_model_mismatch"}
+		}
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "genius_self"}
+	}
 	if cfg.TraeWarmPrefix != "" && strings.HasPrefix(model, cfg.TraeWarmPrefix) {
 		targetModel := strings.TrimPrefix(model, cfg.TraeWarmPrefix)
 		if cfg.TraeWarmModel != "" && targetModel != cfg.TraeWarmModel {
@@ -312,6 +343,15 @@ func routePrefix(cfg pluginConfig, req pluginapi.ModelRouteRequest) pluginapi.Mo
 		return routeProvider(cfg.TraeProvider, strings.TrimPrefix(model, cfg.TraePrefix), req, "trae_prefix")
 	}
 	return pluginapi.ModelRouteResponse{Handled: false}
+}
+
+func isGeniusRequest(raw []byte) bool {
+	var req rpcExecutorRequest
+	if json.Unmarshal(raw, &req) != nil {
+		return false
+	}
+	cfg := loadedConfig()
+	return cfg.GeniusSelfRoute && cfg.GeniusPrefix != "" && strings.HasPrefix(strings.TrimSpace(req.Model), cfg.GeniusPrefix)
 }
 
 func routeProvider(provider string, targetModel string, req pluginapi.ModelRouteRequest, reason string) pluginapi.ModelRouteResponse {
