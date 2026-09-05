@@ -607,6 +607,43 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 	return true, blockReasonOther, time.Time{}
 }
 
+func isStrictFailoverAllowed(candidates []*Auth, authID, model string, now time.Time) bool {
+	if authID == "" {
+		return true
+	}
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.ID == authID {
+			return isAuthHardQuotaBlocked(candidate, model, now)
+		}
+	}
+	return true
+}
+
+func isAuthHardQuotaBlocked(auth *Auth, model string, now time.Time) bool {
+	if auth == nil {
+		return true
+	}
+	if auth.Disabled || auth.Status == StatusDisabled {
+		return true
+	}
+	if auth.Quota.Exceeded {
+		return true
+	}
+	if model != "" && len(auth.ModelStates) > 0 {
+		modelKey := canonicalModelKey(model)
+		for stateModel, state := range auth.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			if state.Status == StatusDisabled || state.Quota.Exceeded {
+				return true
+			}
+		}
+	}
+	blocked, reason, _ := isAuthBlockedForModel(auth, model, now)
+	return blocked && (reason == blockReasonCooldown || reason == blockReasonDisabled)
+}
+
 func isGeminiOrAntigravity(provider, model string) bool {
 	p := strings.ToLower(strings.TrimSpace(provider))
 	if p == "antigravity" || p == "gemini" || p == "aistudio" || p == "vertex" {
@@ -761,11 +798,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
+	var isFailover bool
 	bind := func(authID string) error {
 		if strict {
 			prefixes := []string{provider + "::" + primaryID + "::"}
 			if fallbackKey != "" {
 				prefixes = append(prefixes, provider+"::"+fallbackID+"::")
+			}
+			if isFailover {
+				if fallbackKey != "" {
+					return s.cache.RebindAliasesStrictForPrefixes(authID, prefixes, cacheKey, fallbackKey)
+				}
+				return s.cache.RebindAliasesStrictForPrefixes(authID, prefixes, cacheKey)
+			}
+			if fallbackKey != "" {
 				return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey, fallbackKey)
 			}
 			return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey)
@@ -821,7 +867,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if strict {
-			return nil, strictSessionAuthUnavailableError()
+			if !isStrictFailoverAllowed(availabilityCandidates, cachedAuthID, model, now) {
+				return nil, strictSessionAuthUnavailableError()
+			}
+			isFailover = true
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
 		var auth *Auth
@@ -839,10 +888,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errBind := bind(auth.ID); errBind != nil {
 			return nil, sessionAffinityBindError(errBind)
 		}
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		if isFailover {
+			entry.Warnf("session-affinity: strict failover due to quota limit exhaustion | session=%s old_auth=%s new_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+		} else {
+			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		}
 		return auth, nil
 	}
-	if strictSessionFound {
+	if strictSessionFound && !isFailover {
 		for _, auth := range available {
 			if auth.ID == strictSessionAuthID {
 				if errBind := bind(auth.ID); errBind != nil {
@@ -852,10 +905,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		return nil, strictSessionAuthUnavailableError()
+		if !isStrictFailoverAllowed(availabilityCandidates, strictSessionAuthID, model, now) {
+			return nil, strictSessionAuthUnavailableError()
+		}
+		isFailover = true
 	}
 
-	if fallbackKey != "" {
+	if fallbackKey != "" && !isFailover {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
@@ -867,12 +923,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 			if strict {
-				return nil, strictSessionAuthUnavailableError()
+				if !isStrictFailoverAllowed(availabilityCandidates, cachedAuthID, model, now) {
+					return nil, strictSessionAuthUnavailableError()
+				}
+				isFailover = true
 			}
 		}
 	}
 
-	coldBindingAuths := highestPriorityAuths(codexColdBindingCandidates(available, now))
+	coldBindingAuths := highestPriorityAuths(codexColdBindingCandidates(ctx, available, now))
 	var auth *Auth
 	if isGeminiOrAntigravity(provider, model) {
 		auth = pickGeminiHighestCapacityAuth(fallbackAuths, model)

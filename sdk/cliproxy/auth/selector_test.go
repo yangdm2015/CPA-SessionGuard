@@ -2327,3 +2327,63 @@ func TestManagerSetSelectorConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestSessionAffinitySelector_StrictSelectiveFailover(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		Strict:   true,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a"}
+	authB := &Auth{ID: "auth-b"}
+	auths := []*Auth{authA, authB}
+
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{"Session-Id": []string{"strict-selective-failover-test-1"}},
+	}
+
+	// 1. First pick binds to auth-a
+	picked, err := selector.Pick(context.Background(), "codex", "gpt-4o", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if picked.ID != "auth-a" {
+		t.Fatalf("expected initial pick auth-a, got %s", picked.ID)
+	}
+
+	// 2. Transient error: auth-a is Unavailable, but Quota.Exceeded is false (blockReasonOther).
+	// Under strict mode, transient error MUST NOT switch to auth-b; it should return error.
+	authA.Unavailable = true
+	authA.NextRetryAfter = time.Now().Add(10 * time.Second)
+	_, err = selector.Pick(context.Background(), "codex", "gpt-4o", opts, auths)
+	if err == nil {
+		t.Fatal("expected strict Pick() to fail for transient error, but it succeeded")
+	}
+
+	// 3. Quota limit: auth-a has Quota.Exceeded = true (hard limit).
+	// Under strict mode, quota exhaustion MUST permit failover to auth-b.
+	authA.Quota.Exceeded = true
+	authA.Quota.Reason = "quota"
+	authA.Quota.NextRecoverAt = time.Now().Add(2 * time.Hour)
+	second, err := selector.Pick(context.Background(), "codex", "gpt-4o", opts, auths)
+	if err != nil {
+		t.Fatalf("expected strict Pick() to failover on quota limit, but got error: %v", err)
+	}
+	if second.ID != "auth-b" {
+		t.Fatalf("expected failover to pick auth-b, got %s", second.ID)
+	}
+
+	// 4. Next request should stick to auth-b (cache hit).
+	third, err := selector.Pick(context.Background(), "codex", "gpt-4o", opts, auths)
+	if err != nil {
+		t.Fatalf("expected subsequent Pick() to succeed, got %v", err)
+	}
+	if third.ID != "auth-b" {
+		t.Fatalf("expected subsequent request to stick to auth-b, got %s", third.ID)
+	}
+}

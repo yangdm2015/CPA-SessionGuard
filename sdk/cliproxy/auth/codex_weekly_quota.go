@@ -1,7 +1,12 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"math"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,6 +14,13 @@ import (
 )
 
 const codexWeeklyQuotaObservationsMetadataKey = "codex_weekly_quota_observations"
+
+const (
+	codexWeeklyUsageURL          = "https://chatgpt.com/backend-api/wham/usage"
+	codexWeeklyQuotaProbeTimeout = 8 * time.Second
+	codexWeeklyUsageBodyLimit    = 64 << 10
+	codexWeeklyQuotaThreshold    = 15.0
+)
 
 type codexWeeklyQuotaSnapshot struct {
 	remainingPercent float64
@@ -18,6 +30,20 @@ type codexWeeklyQuotaSnapshot struct {
 type codexWeeklyQuotaState struct {
 	mu       sync.RWMutex
 	snapshot codexWeeklyQuotaSnapshot
+}
+
+type codexUsageWindow struct {
+	UsedPercent        float64 `json:"used_percent"`
+	LimitWindowSeconds int64   `json:"limit_window_seconds"`
+	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	ResetAt            int64   `json:"reset_at"`
+}
+
+type codexUsageResponse struct {
+	RateLimit struct {
+		PrimaryWindow   *codexUsageWindow `json:"primary_window"`
+		SecondaryWindow *codexUsageWindow `json:"secondary_window"`
+	} `json:"rate_limit"`
 }
 
 func (a *Auth) ensureCodexWeeklyQuotaState() {
@@ -95,30 +121,133 @@ func codexWeeklyQuotaObservation(opts cliproxyexecutor.Options, authID string) (
 	return snapshot, ok
 }
 
-func codexColdBindingCandidates(auths []*Auth, now time.Time) []*Auth {
-	hasHealthierCodexAuth := false
+func codexColdBindingCandidates(ctx context.Context, auths []*Auth, now time.Time) []*Auth {
+	if len(auths) <= 1 {
+		return auths
+	}
+	refreshCodexWeeklyQuotas(ctx, auths)
+	return selectCodexWeeklyQuotaCandidates(auths, time.Now())
+}
+
+func selectCodexWeeklyQuotaCandidates(auths []*Auth, now time.Time) []*Auth {
+	if len(auths) <= 1 {
+		return auths
+	}
+	unknown := make([]*Auth, 0, len(auths))
+	known := make([]*Auth, 0, len(auths))
+	healthy := make([]*Auth, 0, len(auths))
+	lowestHealthy := make([]*Auth, 0, len(auths))
+	lowestRemaining := 101.0
+	hasLow := false
+	hasCodexAuth := false
 	for _, auth := range auths {
 		if !isCodexAuth(auth) {
 			continue
 		}
-		if remaining, known := auth.codexWeeklyQuotaRemaining(now); known && remaining > 5 {
-			hasHealthierCodexAuth = true
-			break
-		}
-	}
-	if !hasHealthierCodexAuth {
-		return auths
-	}
-
-	filtered := make([]*Auth, 0, len(auths))
-	for _, auth := range auths {
-		remaining, known := auth.codexWeeklyQuotaRemaining(now)
-		if isCodexAuth(auth) && known && remaining <= 5 {
+		hasCodexAuth = true
+		remaining, quotaKnown := auth.codexWeeklyQuotaRemaining(now)
+		if !quotaKnown {
+			unknown = append(unknown, auth)
 			continue
 		}
-		filtered = append(filtered, auth)
+		known = append(known, auth)
+		if remaining < codexWeeklyQuotaThreshold {
+			hasLow = true
+			continue
+		}
+		healthy = append(healthy, auth)
+		switch {
+		case remaining < lowestRemaining:
+			lowestRemaining = remaining
+			lowestHealthy = append(lowestHealthy[:0], auth)
+		case remaining == lowestRemaining:
+			lowestHealthy = append(lowestHealthy, auth)
+		}
 	}
-	return filtered
+	if !hasCodexAuth {
+		return auths
+	}
+	if len(unknown) > 0 {
+		return unknown
+	}
+	if len(healthy) == 0 {
+		return known
+	}
+	if hasLow {
+		return healthy
+	}
+	if len(lowestHealthy) > 0 {
+		return lowestHealthy
+	}
+	return auths
+}
+
+func refreshCodexWeeklyQuotas(ctx context.Context, auths []*Auth) {
+	var wg sync.WaitGroup
+	for _, auth := range auths {
+		if !isCodexAuth(auth) {
+			continue
+		}
+		wg.Add(1)
+		go func(candidate *Auth) {
+			defer wg.Done()
+			remaining, resetAt, ok := fetchCodexWeeklyQuota(ctx, candidate)
+			if ok {
+				candidate.observeCodexWeeklyQuota(remaining, resetAt)
+			}
+		}(auth)
+	}
+	wg.Wait()
+}
+
+func fetchCodexWeeklyQuota(ctx context.Context, auth *Auth) (float64, time.Time, bool) {
+	if auth == nil || auth.Metadata == nil {
+		return 0, time.Time{}, false
+	}
+	accessToken, _ := auth.Metadata["access_token"].(string)
+	accountID, _ := auth.Metadata["account_id"].(string)
+	accessToken = strings.TrimSpace(accessToken)
+	accountID = strings.TrimSpace(accountID)
+	if accessToken == "" || accountID == "" {
+		return 0, time.Time{}, false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, codexWeeklyQuotaProbeTimeout)
+	defer cancel()
+	req, errRequest := http.NewRequestWithContext(probeCtx, http.MethodGet, codexWeeklyUsageURL, nil)
+	if errRequest != nil {
+		return 0, time.Time{}, false
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("ChatGPT-Account-Id", accountID)
+	req.Header.Set("Accept", "application/json")
+
+	response, errDo := http.DefaultClient.Do(req)
+	if errDo != nil {
+		return 0, time.Time{}, false
+	}
+	var usage codexUsageResponse
+	errDecode := json.NewDecoder(io.LimitReader(response.Body, codexWeeklyUsageBodyLimit)).Decode(&usage)
+	errClose := response.Body.Close()
+	if response.StatusCode != http.StatusOK || errDecode != nil || errClose != nil {
+		return 0, time.Time{}, false
+	}
+
+	now := time.Now()
+	for _, window := range []*codexUsageWindow{usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow} {
+		if window == nil || window.LimitWindowSeconds != int64((7*24*time.Hour)/time.Second) {
+			continue
+		}
+		resetAt := time.Unix(window.ResetAt, 0)
+		if !resetAt.After(now) && window.ResetAfterSeconds > 0 {
+			resetAt = now.Add(time.Duration(window.ResetAfterSeconds) * time.Second)
+		}
+		remaining := math.Max(0, math.Min(100, 100-window.UsedPercent))
+		if validCodexWeeklyQuota(remaining, resetAt) {
+			return remaining, resetAt, true
+		}
+	}
+	return 0, time.Time{}, false
 }
 
 func isCodexAuth(auth *Auth) bool {

@@ -44,6 +44,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
+	structuredResponseOnly := helps.ClaudeStructuredResponseOnly(from, responseFormat, originalPayload)
 	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, true, helps.APIKeyModelIsCompat(req))
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
@@ -189,6 +190,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if eventType == "response.completed" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
+					}
+					translatedLine = append([]byte("data: "), data...)
+				}
+				if structuredResponseOnly {
+					data = helps.FilterCodexStructuredResponse(data)
+					if len(data) == 0 {
+						continue
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}

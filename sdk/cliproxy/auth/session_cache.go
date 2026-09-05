@@ -362,6 +362,44 @@ func (c *SessionCache) BindAliasesStrictForPrefixes(authID string, prefixes []st
 	return c.persistLocked()
 }
 
+// RebindAliasesStrictForPrefixes atomically replaces any existing bindings matching prefixes
+// with authID for authorized failovers (e.g. quota limit exhaustion).
+func (c *SessionCache) RebindAliasesStrictForPrefixes(authID string, prefixes []string, sessionIDs ...string) error {
+	if authID == "" {
+		return nil
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureStoreAvailableLocked(); err != nil {
+		return err
+	}
+
+	aliases := mergeSessionAliases(nil, sessionIDs...)
+	previousGroups := make([]sessionEntry, 0, len(sessionIDs))
+	for key, entry := range c.entries {
+		if !c.entryActiveLocked(now, entry) || !hasAnySessionPrefix(key, prefixes) {
+			continue
+		}
+		previousGroups = append(previousGroups, entry)
+		aliases = mergeSessionAliases(aliases, entry.aliases...)
+	}
+	for _, sessionID := range sessionIDs {
+		entry, ok := c.entries[sessionID]
+		if !ok {
+			continue
+		}
+		previousGroups = append(previousGroups, entry)
+		aliases = mergeSessionAliases(aliases, entry.aliases...)
+	}
+	aliases = compactSessionAliases(aliases)
+	if len(aliases) == 0 {
+		return nil
+	}
+	c.replaceAliasGroupsLocked(authID, now.Add(c.ttl), aliases, previousGroups...)
+	return c.persistLocked()
+}
+
 func hasAnySessionPrefix(key string, prefixes []string) bool {
 	for _, prefix := range prefixes {
 		if prefix != "" && strings.HasPrefix(key, prefix) {
