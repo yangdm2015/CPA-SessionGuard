@@ -2387,3 +2387,33 @@ func TestSessionAffinitySelector_StrictSelectiveFailover(t *testing.T) {
 		t.Fatalf("expected subsequent request to stick to auth-b, got %s", third.ID)
 	}
 }
+
+func TestSelectCodexWeeklyQuotaCandidates_NearestResetFirst(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	authA := &Auth{ID: "auth-a", Provider: "codex"}
+	authA.Metadata = map[string]any{"type": "codex"}
+	// auth-a: remaining 60%, resets in 1 day
+	authA.observeCodexWeeklyQuota(60.0, now.Add(24*time.Hour))
+
+	authB := &Auth{ID: "auth-b", Provider: "codex"}
+	authB.Metadata = map[string]any{"type": "codex"}
+	// auth-b: remaining 40%, resets in 4 days
+	authB.observeCodexWeeklyQuota(40.0, now.Add(4*24*time.Hour))
+
+	candidates := selectCodexWeeklyQuotaCandidates([]*Auth{authA, authB}, now)
+	if len(candidates) != 1 || candidates[0].ID != "auth-a" {
+		t.Fatalf("expected auth-a (earliest reset in 24h), got: %v", candidates)
+	}
+
+	// Tie-break: same reset time within 1h -> burn down lower remaining first
+	authC := &Auth{ID: "auth-c", Provider: "codex"}
+	authC.Metadata = map[string]any{"type": "codex"}
+	authC.observeCodexWeeklyQuota(20.0, now.Add(24*time.Hour+10*time.Minute))
+
+	candidates2 := selectCodexWeeklyQuotaCandidates([]*Auth{authA, authC}, now)
+	if len(candidates2) < 1 || candidates2[0].ID != "auth-c" {
+		t.Fatalf("expected auth-c (lower remaining within same window), got: %v", candidates2)
+	}
+}
