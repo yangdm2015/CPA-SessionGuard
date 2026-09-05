@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"sort"
 	"context"
 	"encoding/json"
 	"io"
@@ -79,19 +78,6 @@ func (a *Auth) codexWeeklyQuotaRemaining(now time.Time) (float64, bool) {
 	return snapshot.remainingPercent, true
 }
 
-func (a *Auth) codexWeeklyQuotaSnapshot(now time.Time) (codexWeeklyQuotaSnapshot, bool) {
-	if a == nil || a.codexWeeklyQuota == nil {
-		return codexWeeklyQuotaSnapshot{}, false
-	}
-	a.codexWeeklyQuota.mu.RLock()
-	snapshot := a.codexWeeklyQuota.snapshot
-	a.codexWeeklyQuota.mu.RUnlock()
-	if !validCodexWeeklyQuota(snapshot.remainingPercent, snapshot.resetAt) || !now.Before(snapshot.resetAt) {
-		return codexWeeklyQuotaSnapshot{}, false
-	}
-	return snapshot, true
-}
-
 func validCodexWeeklyQuota(remainingPercent float64, resetAt time.Time) bool {
 	return !math.IsNaN(remainingPercent) && !math.IsInf(remainingPercent, 0) &&
 		remainingPercent >= 0 && remainingPercent <= 100 && !resetAt.IsZero()
@@ -143,88 +129,55 @@ func codexColdBindingCandidates(ctx context.Context, auths []*Auth, now time.Tim
 	return selectCodexWeeklyQuotaCandidates(auths, time.Now())
 }
 
-type candidateQuota struct {
-	auth             *Auth
-	remainingPercent float64
-	resetAt          time.Time
-}
-
 func selectCodexWeeklyQuotaCandidates(auths []*Auth, now time.Time) []*Auth {
 	if len(auths) <= 1 {
 		return auths
 	}
 	unknown := make([]*Auth, 0, len(auths))
-	healthy := make([]candidateQuota, 0, len(auths))
-	low := make([]candidateQuota, 0, len(auths))
+	known := make([]*Auth, 0, len(auths))
+	healthy := make([]*Auth, 0, len(auths))
+	lowestHealthy := make([]*Auth, 0, len(auths))
+	lowestRemaining := 101.0
+	hasLow := false
 	hasCodexAuth := false
-
 	for _, auth := range auths {
 		if !isCodexAuth(auth) {
 			continue
 		}
 		hasCodexAuth = true
-		snapshot, quotaKnown := auth.codexWeeklyQuotaSnapshot(now)
+		remaining, quotaKnown := auth.codexWeeklyQuotaRemaining(now)
 		if !quotaKnown {
 			unknown = append(unknown, auth)
 			continue
 		}
-		if snapshot.remainingPercent <= 0 {
+		known = append(known, auth)
+		if remaining < codexWeeklyQuotaThreshold {
+			hasLow = true
 			continue
 		}
-		cand := candidateQuota{
-			auth:             auth,
-			remainingPercent: snapshot.remainingPercent,
-			resetAt:          snapshot.resetAt,
-		}
-		if snapshot.remainingPercent < codexWeeklyQuotaThreshold {
-			low = append(low, cand)
-		} else {
-			healthy = append(healthy, cand)
+		healthy = append(healthy, auth)
+		switch {
+		case remaining < lowestRemaining:
+			lowestRemaining = remaining
+			lowestHealthy = append(lowestHealthy[:0], auth)
+		case remaining == lowestRemaining:
+			lowestHealthy = append(lowestHealthy, auth)
 		}
 	}
 	if !hasCodexAuth {
 		return auths
 	}
-
-	bestCandidates := func(cands []candidateQuota) []*Auth {
-		if len(cands) == 0 {
-			return nil
-		}
-		// Sort: earliest reset time comes first.
-		// If reset times are within 1 hour, tie-break by lower remaining percent (burn-down).
-		sort.SliceStable(cands, func(i, j int) bool {
-			diff := cands[i].resetAt.Sub(cands[j].resetAt)
-			if diff > time.Hour {
-				return false
-			}
-			if diff < -time.Hour {
-				return true
-			}
-			return cands[i].remainingPercent < cands[j].remainingPercent
-		})
-
-		earliestReset := cands[0].resetAt
-		var winners []*Auth
-		for _, c := range cands {
-			diff := c.resetAt.Sub(earliestReset)
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff <= time.Hour {
-				winners = append(winners, c.auth)
-			}
-		}
-		return winners
-	}
-
-	if len(healthy) > 0 {
-		return bestCandidates(healthy)
-	}
-	if len(low) > 0 {
-		return bestCandidates(low)
-	}
 	if len(unknown) > 0 {
 		return unknown
+	}
+	if len(healthy) == 0 {
+		return known
+	}
+	if hasLow {
+		return healthy
+	}
+	if len(lowestHealthy) > 0 {
+		return lowestHealthy
 	}
 	return auths
 }
