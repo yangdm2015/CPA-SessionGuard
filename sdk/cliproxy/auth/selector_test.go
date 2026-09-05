@@ -2387,3 +2387,40 @@ func TestSessionAffinitySelector_StrictSelectiveFailover(t *testing.T) {
 		t.Fatalf("expected subsequent request to stick to auth-b, got %s", third.ID)
 	}
 }
+
+func TestPickGeminiHighestCapacityAuth_NearestResetTimeFirst(t *testing.T) {
+	now := time.Now()
+
+	authA := &Auth{ID: "antigravity-a", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-a", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(3 * 24 * time.Hour), // resets in 3 days (earlier)
+		WeeklyRemainingFraction: 0.99,
+		FetchedAt:               now,
+	})
+
+	authB := &Auth{ID: "antigravity-b", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-b", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(7 * 24 * time.Hour), // resets in 7 days (later)
+		WeeklyRemainingFraction: 1.0,
+		FetchedAt:               now,
+	})
+
+	// auth-a resets in 3 days, auth-b resets in 7 days.
+	// auth-a MUST be selected because its reset time is closer!
+	picked := pickGeminiHighestCapacityAuth([]*Auth{authB, authA}, "gemini-3.8-flash-high")
+	if picked == nil || picked.ID != "antigravity-a" {
+		t.Fatalf("expected antigravity-a (closest reset), got: %v", picked)
+	}
+
+	// Tie-break when reset times are similar (within 1 hour): higher capacity score wins
+	authC := &Auth{ID: "antigravity-c", Provider: "antigravity", Attributes: map[string]string{"priority": "2"}}
+	SetAntigravityQuotaSnapshot("antigravity-c", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(3*24*time.Hour + 10*time.Minute), // within 1h of auth-a
+		WeeklyRemainingFraction: 0.99,
+		FetchedAt:               now,
+	})
+	picked2 := pickGeminiHighestCapacityAuth([]*Auth{authA, authC}, "gemini-3.8-flash-high")
+	if picked2 == nil || picked2.ID != "antigravity-c" {
+		t.Fatalf("expected antigravity-c (higher priority tie-break), got: %v", picked2)
+	}
+}

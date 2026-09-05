@@ -686,13 +686,57 @@ func pickGeminiHighestCapacityAuth(candidates []*Auth, model string) *Auth {
 		return nil
 	}
 	now := time.Now()
+	refreshAntigravityQuotasAsync(candidates)
+
 	var best *Auth
 	var bestScore float64
+	var bestResetAt time.Time
+	var bestHasReset bool
+
 	for i, a := range candidates {
 		score := authCapacityScore(a, model, now)
-		if i == 0 || score > bestScore {
+		snap, hasSnap := GetAntigravityQuotaSnapshot(a.ID)
+		hasReset := hasSnap && !snap.WeeklyResetAt.IsZero() && snap.WeeklyResetAt.After(now)
+
+		if i == 0 {
 			best = a
 			bestScore = score
+			bestResetAt = snap.WeeklyResetAt
+			bestHasReset = hasReset
+			continue
+		}
+
+		// Factor in reset time: if both candidates have known weekly reset times and differ by > 1 hour,
+		// prioritize the one whose reset time is closest (expiring soonest).
+		if hasReset && bestHasReset {
+			diff := snap.WeeklyResetAt.Sub(bestResetAt)
+			if diff < -time.Hour {
+				// 'a' resets noticeably earlier than 'best' -> prefer 'a'
+				best = a
+				bestScore = score
+				bestResetAt = snap.WeeklyResetAt
+				bestHasReset = true
+				continue
+			} else if diff > time.Hour {
+				// 'best' resets noticeably earlier -> keep 'best'
+				continue
+			}
+		} else if hasReset && !bestHasReset {
+			best = a
+			bestScore = score
+			bestResetAt = snap.WeeklyResetAt
+			bestHasReset = true
+			continue
+		} else if !hasReset && bestHasReset {
+			continue
+		}
+
+		// Tie-break (similar reset times or unknown): pick by capacity / recent request score
+		if score > bestScore {
+			best = a
+			bestScore = score
+			bestResetAt = snap.WeeklyResetAt
+			bestHasReset = hasReset
 		}
 	}
 	return best
