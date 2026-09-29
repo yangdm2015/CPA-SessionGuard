@@ -608,12 +608,22 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 }
 
 func isStrictFailoverAllowed(candidates []*Auth, authID, model string, now time.Time) bool {
+	return isStrictFailoverAllowedWithThreshold(candidates, authID, model, DefaultWeeklyQuotaThreshold, now)
+}
+
+func isStrictFailoverAllowedWithThreshold(candidates []*Auth, authID, model string, threshold float64, now time.Time) bool {
 	if authID == "" {
 		return true
 	}
 	for _, candidate := range candidates {
 		if candidate != nil && candidate.ID == authID {
-			return isAuthHardQuotaBlocked(candidate, model, now)
+			if isAuthHardQuotaBlocked(candidate, model, now) {
+				return true
+			}
+			if IsAuthWeeklyQuotaDepleted(candidate, threshold, now) {
+				return true
+			}
+			return false
 		}
 	}
 	return true
@@ -687,6 +697,7 @@ func pickGeminiHighestCapacityAuth(candidates []*Auth, model string) *Auth {
 	}
 	now := time.Now()
 	refreshAntigravityQuotasAsync(candidates)
+	candidates = FilterAuthsAboveWeeklyQuotaThreshold(candidates, DefaultWeeklyQuotaThreshold, now)
 
 	var best *Auth
 	var bestScore float64
@@ -746,19 +757,21 @@ func pickGeminiHighestCapacityAuth(candidates []*Auth, model string) *Auth {
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with configurable failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	mu       sync.RWMutex
-	stopOnce sync.Once
-	fallback Selector
-	cache    *SessionCache
-	strict   bool
+	mu                   sync.RWMutex
+	stopOnce             sync.Once
+	fallback             Selector
+	cache                *SessionCache
+	strict               bool
+	weeklyQuotaThreshold float64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	Strict   bool
-	TTL      time.Duration
-	Store    SessionBindingStore
+	Fallback             Selector
+	Strict               bool
+	TTL                  time.Duration
+	Store                SessionBindingStore
+	WeeklyQuotaThreshold float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -781,10 +794,15 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if errStore != nil {
 		log.Errorf("failed to restore session affinity bindings: %v", errStore)
 	}
+	threshold := cfg.WeeklyQuotaThreshold
+	if threshold <= 0 {
+		threshold = DefaultWeeklyQuotaThreshold
+	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    cache,
-		strict:   cfg.Strict,
+		fallback:             cfg.Fallback,
+		cache:                cache,
+		strict:               cfg.Strict,
+		weeklyQuotaThreshold: threshold,
 	}
 }
 
@@ -802,8 +820,11 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	s.mu.RLock()
-	fallback, strict := s.fallback, s.strict
+	fallback, strict, weeklyThreshold := s.fallback, s.strict, s.weeklyQuotaThreshold
 	defer s.mu.RUnlock()
+	if weeklyThreshold <= 0 {
+		weeklyThreshold = DefaultWeeklyQuotaThreshold
+	}
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -834,6 +855,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
+	refreshAntigravityQuotasAsync(available)
 	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
@@ -896,6 +918,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	} else if cached {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if IsAuthWeeklyQuotaDepleted(auth, weeklyThreshold, now) && HasAlternativeAuthAboveWeeklyThreshold(available, auth.ID, weeklyThreshold, now) {
+					entry.Warnf("session-affinity: failover due to weekly quota below threshold (%.4f) | session=%s old_auth=%s provider=%s model=%s",
+						weeklyThreshold, truncateSessionID(primaryID), cachedAuthID, provider, model)
+					isFailover = true
+					break
+				}
 				aliasesReady := fallbackKey == ""
 				if !aliasesReady {
 					fallbackAuthID, fallbackFound := s.cache.Get(fallbackKey)
@@ -911,20 +939,21 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if strict {
-			if !isStrictFailoverAllowed(availabilityCandidates, cachedAuthID, model, now) {
+			if !isStrictFailoverAllowedWithThreshold(availabilityCandidates, cachedAuthID, model, weeklyThreshold, now) {
 				return nil, strictSessionAuthUnavailableError()
 			}
 			isFailover = true
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
 		var auth *Auth
+		eligibleFallbackAuths := FilterAuthsAboveWeeklyQuotaThreshold(fallbackAuths, weeklyThreshold, now)
 		if isGeminiOrAntigravity(provider, model) {
-			auth = pickGeminiHighestCapacityAuth(fallbackAuths, model)
+			auth = pickGeminiHighestCapacityAuth(eligibleFallbackAuths, model)
 			if auth == nil {
 				err = &Error{Code: "auth_unavailable", Message: "no available auth for gemini"}
 			}
 		} else {
-			auth, err = fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+			auth, err = fallback.Pick(ctx, provider, model, opts, eligibleFallbackAuths)
 		}
 		if err != nil {
 			return nil, err
@@ -942,6 +971,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if strictSessionFound && !isFailover {
 		for _, auth := range available {
 			if auth.ID == strictSessionAuthID {
+				if IsAuthWeeklyQuotaDepleted(auth, weeklyThreshold, now) && HasAlternativeAuthAboveWeeklyThreshold(available, auth.ID, weeklyThreshold, now) {
+					entry.Warnf("session-affinity: cross-model failover due to weekly quota below threshold (%.4f) | session=%s old_auth=%s provider=%s model=%s",
+						weeklyThreshold, truncateSessionID(primaryID), strictSessionAuthID, provider, model)
+					isFailover = true
+					break
+				}
 				if errBind := bind(auth.ID); errBind != nil {
 					return nil, sessionAffinityBindError(errBind)
 				}
@@ -949,7 +984,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		if !isStrictFailoverAllowed(availabilityCandidates, strictSessionAuthID, model, now) {
+		if !isStrictFailoverAllowedWithThreshold(availabilityCandidates, strictSessionAuthID, model, weeklyThreshold, now) {
 			return nil, strictSessionAuthUnavailableError()
 		}
 		isFailover = true
@@ -959,6 +994,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
+					if IsAuthWeeklyQuotaDepleted(auth, weeklyThreshold, now) && HasAlternativeAuthAboveWeeklyThreshold(available, auth.ID, weeklyThreshold, now) {
+						entry.Warnf("session-affinity: fallback failover due to weekly quota below threshold (%.4f) | session=%s old_auth=%s provider=%s model=%s",
+							weeklyThreshold, truncateSessionID(primaryID), cachedAuthID, provider, model)
+						isFailover = true
+						break
+					}
 					if errBind := bind(auth.ID); errBind != nil {
 						return nil, sessionAffinityBindError(errBind)
 					}
@@ -967,7 +1008,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 			if strict {
-				if !isStrictFailoverAllowed(availabilityCandidates, cachedAuthID, model, now) {
+				if !isStrictFailoverAllowedWithThreshold(availabilityCandidates, cachedAuthID, model, weeklyThreshold, now) {
 					return nil, strictSessionAuthUnavailableError()
 				}
 				isFailover = true
@@ -976,14 +1017,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	coldBindingAuths := highestPriorityAuths(codexColdBindingCandidates(ctx, available, now))
+	eligibleColdBindingAuths := FilterAuthsAboveWeeklyQuotaThreshold(coldBindingAuths, weeklyThreshold, now)
+	eligibleFallbackAuths := FilterAuthsAboveWeeklyQuotaThreshold(fallbackAuths, weeklyThreshold, now)
 	var auth *Auth
 	if isGeminiOrAntigravity(provider, model) {
-		auth = pickGeminiHighestCapacityAuth(fallbackAuths, model)
+		auth = pickGeminiHighestCapacityAuth(eligibleFallbackAuths, model)
 		if auth == nil {
 			err = &Error{Code: "auth_unavailable", Message: "no available auth for gemini"}
 		}
 	} else {
-		auth, err = fallback.Pick(ctx, provider, model, opts, coldBindingAuths)
+		auth, err = fallback.Pick(ctx, provider, model, opts, eligibleColdBindingAuths)
 	}
 	if err != nil {
 		return nil, err

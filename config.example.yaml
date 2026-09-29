@@ -224,6 +224,9 @@ routing:
   session-affinity-persist: false
   # Optional override. Default: <auth-dir>/.session-affinity.sab
   # session-affinity-store: "/var/lib/cliproxyapi/session-affinity.sab"
+  # Minimum weekly remaining quota fraction threshold to trigger session failover (default: 0.01 for 1%).
+  # If a bound credential's weekly quota drops below this and alternatives exist, affinity switches.
+  # weekly-quota-threshold: 0.01
 
 # Codex provider behavior.
 codex:

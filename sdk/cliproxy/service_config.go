@@ -33,12 +33,14 @@ type routingRuntimeState struct {
 	sessionAffinityTTL       time.Duration
 	sessionAffinityPersist   bool
 	sessionAffinityStorePath string
+	weeklyQuotaThreshold     float64
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
-		sessionAffinityTTL: time.Hour,
+		strategy:             "round-robin",
+		sessionAffinityTTL:   time.Hour,
+		weeklyQuotaThreshold: coreauth.DefaultWeeklyQuotaThreshold,
 	}
 	if cfg == nil {
 		return state
@@ -65,6 +67,9 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 			state.sessionAffinityStorePath = filepath.Join(strings.TrimSpace(cfg.AuthDir), ".session-affinity.sab")
 		}
 	}
+	if cfg.Routing.WeeklyQuotaThreshold > 0 {
+		state.weeklyQuotaThreshold = cfg.Routing.WeeklyQuotaThreshold
+	}
 	return state
 }
 
@@ -89,10 +94,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			store = coreauth.NewFileSessionBindingStore(state.sessionAffinityStorePath)
 		}
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			Strict:   state.sessionAffinityStrict,
-			TTL:      state.sessionAffinityTTL,
-			Store:    store,
+			Fallback:             selector,
+			Strict:               state.sessionAffinityStrict,
+			TTL:                  state.sessionAffinityTTL,
+			Store:                store,
+			WeeklyQuotaThreshold: state.weeklyQuotaThreshold,
 		})
 	}
 	return selector

@@ -2424,3 +2424,188 @@ func TestPickGeminiHighestCapacityAuth_NearestResetTimeFirst(t *testing.T) {
 		t.Fatalf("expected antigravity-c (higher priority tie-break), got: %v", picked2)
 	}
 }
+
+func TestSessionAffinitySelector_WeeklyQuotaBelowThresholdFailover(t *testing.T) {
+	now := time.Now()
+
+	authLow := &Auth{ID: "antigravity-low", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-low", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(24 * time.Hour),
+		WeeklyRemainingFraction: 0.005, // 0.5% < 1%
+		FetchedAt:               now,
+	})
+
+	authHigh := &Auth{ID: "antigravity-high", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-high", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(48 * time.Hour),
+		WeeklyRemainingFraction: 0.50, // 50% > 1%
+		FetchedAt:               now,
+	})
+
+	auths := []*Auth{authLow, authHigh}
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             fallback,
+		Strict:               true,
+		TTL:                  time.Hour,
+		WeeklyQuotaThreshold: 0.01,
+	})
+
+	sessionID := "sess-weekly-quota-test"
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{
+			"Session-Id": []string{sessionID},
+		},
+	}
+
+	// First, manually bind the session to authLow to simulate an established binding
+	modelKey := canonicalModelKey("gemini-3.8-flash-high")
+	cacheKey := "antigravity::" + sessionID + "::" + modelKey
+	if errBind := selector.cache.BindAliasesStrict(authLow.ID, cacheKey); errBind != nil {
+		t.Fatalf("failed to bind session: %v", errBind)
+	}
+
+	// Now pick with the established session binding. Because authLow weekly quota is < 1%
+	// and authHigh has > 1%, it MUST failover to authHigh!
+	picked, err := selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() failed: %v", err)
+	}
+	if picked.ID != "antigravity-high" {
+		t.Fatalf("expected failover to antigravity-high, got %s", picked.ID)
+	}
+
+	// Subsequent request with the same session must now stick to antigravity-high
+	second, err := selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", opts, auths)
+	if err != nil {
+		t.Fatalf("subsequent Pick() failed: %v", err)
+	}
+	if second.ID != "antigravity-high" {
+		t.Fatalf("expected subsequent request to stick to antigravity-high, got %s", second.ID)
+	}
+}
+
+func TestSessionAffinitySelector_WeeklyQuotaAllDepletedFallback(t *testing.T) {
+	now := time.Now()
+
+	authLow1 := &Auth{ID: "antigravity-low1", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-low1", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(24 * time.Hour),
+		WeeklyRemainingFraction: 0.005, // 0.5% < 1%
+		FetchedAt:               now,
+	})
+
+	authLow2 := &Auth{ID: "antigravity-low2", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-low2", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(48 * time.Hour),
+		WeeklyRemainingFraction: 0.003, // 0.3% < 1%
+		FetchedAt:               now,
+	})
+
+	auths := []*Auth{authLow1, authLow2}
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             fallback,
+		Strict:               true,
+		TTL:                  time.Hour,
+		WeeklyQuotaThreshold: 0.01,
+	})
+
+	sessionID := "sess-all-depleted-test"
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{
+			"Session-Id": []string{sessionID},
+		},
+	}
+
+	// Manually bind to authLow1
+	modelKey := canonicalModelKey("gemini-3.8-flash-high")
+	cacheKey := "antigravity::" + sessionID + "::" + modelKey
+	if errBind := selector.cache.BindAliasesStrict(authLow1.ID, cacheKey); errBind != nil {
+		t.Fatalf("failed to bind session: %v", errBind)
+	}
+
+	// When all alternatives are also below 1%, it should NOT failover and keep authLow1
+	picked, err := selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() failed: %v", err)
+	}
+	if picked.ID != "antigravity-low1" {
+		t.Fatalf("expected to keep antigravity-low1 when all are depleted, got %s", picked.ID)
+	}
+}
+
+func TestPickGeminiHighestCapacityAuth_WeeklyQuotaBelowThresholdFiltered(t *testing.T) {
+	now := time.Now()
+
+	authLow := &Auth{ID: "antigravity-low", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-low", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(12 * time.Hour), // resets sooner
+		WeeklyRemainingFraction: 0.004,                   // 0.4% < 1%
+		FetchedAt:               now,
+	})
+
+	authHigh := &Auth{ID: "antigravity-high", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-high", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(72 * time.Hour), // resets later
+		WeeklyRemainingFraction: 0.80,                    // 80% > 1%
+		FetchedAt:               now,
+	})
+
+	// Even though authLow has a much closer reset time (12h vs 72h),
+	// authHigh MUST be selected because authLow weekly quota is < 1%!
+	picked := pickGeminiHighestCapacityAuth([]*Auth{authLow, authHigh}, "gemini-3.8-flash-high")
+	if picked == nil || picked.ID != "antigravity-high" {
+		t.Fatalf("expected antigravity-high to be picked over depleted antigravity-low, got: %v", picked)
+	}
+}
+
+func TestSessionAffinitySelector_StrictWeeklyQuotaBelowThresholdFailover(t *testing.T) {
+	now := time.Now()
+
+	authLow := &Auth{ID: "antigravity-low", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-low", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(24 * time.Hour),
+		WeeklyRemainingFraction: 0.005, // 0.5% < 1%
+		FetchedAt:               now,
+	})
+
+	authHigh := &Auth{ID: "antigravity-high", Provider: "antigravity"}
+	SetAntigravityQuotaSnapshot("antigravity-high", AntigravityQuotaSnapshot{
+		WeeklyResetAt:           now.Add(48 * time.Hour),
+		WeeklyRemainingFraction: 0.50, // 50% > 1%
+		FetchedAt:               now,
+	})
+
+	auths := []*Auth{authLow, authHigh}
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             fallback,
+		Strict:               true,
+		TTL:                  time.Hour,
+		WeeklyQuotaThreshold: 0.01,
+	})
+
+	sessionID := "sess-strict-weekly-failover"
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{
+			"Session-Id": []string{sessionID},
+		},
+	}
+
+	modelKey := canonicalModelKey("gemini-3.8-flash-high")
+	cacheKey := "antigravity::" + sessionID + "::" + modelKey
+	if errBind := selector.cache.BindAliasesStrict(authLow.ID, cacheKey); errBind != nil {
+		t.Fatalf("failed to bind: %v", errBind)
+	}
+
+	// Under strict: true, because authLow weekly quota < 1% and authHigh > 1%,
+	// strict failover MUST be allowed and pick authHigh!
+	picked, err := selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() in strict mode failed: %v", err)
+	}
+	if picked.ID != "antigravity-high" {
+		t.Fatalf("expected strict failover to antigravity-high, got %s", picked.ID)
+	}
+}

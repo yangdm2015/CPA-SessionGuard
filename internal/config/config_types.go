@@ -248,6 +248,11 @@ type RoutingConfig struct {
 	// SessionAffinityStore optionally overrides the persistent binding file path.
 	// The default is .session-affinity.sab under auth-dir.
 	SessionAffinityStore string `yaml:"session-affinity-store,omitempty" json:"session-affinity-store,omitempty"`
+
+	// WeeklyQuotaThreshold defines the minimum weekly remaining quota fraction (default: 0.01 for 1%).
+	// If a bound credential's weekly quota drops below this threshold and alternatives exist,
+	// session affinity triggers failover to an alternative credential.
+	WeeklyQuotaThreshold float64 `yaml:"weekly-quota-threshold,omitempty" json:"weekly-quota-threshold,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
