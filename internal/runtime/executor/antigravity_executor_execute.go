@@ -70,6 +70,10 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		reporter.UpdateAccessTokenFingerprint(auth)
 	}
 	originalTranslated, translated := helps.TranslateRequestPairWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
+	if normalized, count := helps.NormalizeGeminiSDKIdentity(translated, from.String(), baseModel); count > 0 {
+		translated = normalized
+		log.Debugf("antigravity executor: normalized %d Claude SDK identity block(s) for model %s", count, baseModel)
+	}
 
 	translated, err = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayloadSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -296,6 +300,10 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 		reporter.UpdateAccessTokenFingerprint(auth)
 	}
 	originalTranslated, translated := helps.TranslateRequestPairWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
+	if normalized, count := helps.NormalizeGeminiSDKIdentity(translated, from.String(), baseModel); count > 0 {
+		translated = normalized
+		log.Debugf("antigravity executor: normalized %d Claude SDK identity block(s) for model %s", count, baseModel)
+	}
 
 	translated, err = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayloadSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {

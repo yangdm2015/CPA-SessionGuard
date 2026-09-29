@@ -65,6 +65,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	}
 
 	originalTranslated, translated := helps.TranslateRequestPairWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
+	if normalized, count := helps.NormalizeGeminiSDKIdentity(translated, from.String(), baseModel); count > 0 {
+		translated = normalized
+		log.Debugf("antigravity executor: normalized %d Claude SDK identity block(s) for model %s", count, baseModel)
+	}
 
 	translated, err = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayloadSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
