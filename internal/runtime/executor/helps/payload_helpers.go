@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -30,15 +30,48 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 	return out
 }
 
-// ApplyPayloadConfigWithRequestTracked applies payload config and reports whether
-// an applied rule targeted trackedPath or one of its descendants.
-func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPath string) ([]byte, bool) {
-	if cfg == nil || len(payload) == 0 {
-		return payload, false
+// ApplyPayloadConfigWithRequestForExecutor applies payload config with explicit target executor context.
+func ApplyPayloadConfigWithRequestForExecutor(cfg *config.Config, targetExecutor, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header) []byte {
+	out, _ := ApplyPayloadConfigWithTrackedPathsForExecutor(cfg, targetExecutor, model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers)
+	return out
+}
+
+func isCodexTargetExecutor(targetExecutor string) bool {
+	te := strings.ToLower(strings.TrimSpace(targetExecutor))
+	return te == "codex" || te == "codex-websockets" || te == "codex_websockets"
+}
+
+// ApplyPayloadConfigWithTrackedPaths applies payload config and reports which
+// tracked paths (or their descendants) were targeted by an applied rule.
+func ApplyPayloadConfigWithTrackedPaths(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPaths ...string) ([]byte, map[string]bool) {
+	return ApplyPayloadConfigWithTrackedPathsForExecutor(cfg, "", model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers, trackedPaths...)
+}
+
+// ApplyPayloadConfigWithTrackedPathsForExecutor applies payload config with target executor awareness.
+// When headers indicate a Codex client and the target executor is not Codex or Codex WebSocket,
+// it normalizes tool parameter integer types to satisfy client-side integer deserialization (#6237).
+// For Codex and Codex WebSocket targets, integer normalization is skipped (#6244).
+func ApplyPayloadConfigWithTrackedPathsForExecutor(cfg *config.Config, targetExecutor, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPaths ...string) ([]byte, map[string]bool) {
+	touched := make(map[string]bool)
+	if len(payload) == 0 {
+		return payload, touched
+	}
+	if IsCodexUserAgent(headers) && !isCodexTargetExecutor(targetExecutor) {
+		payload = NormalizeCodexToolIntegerTypes(payload, headers)
+	}
+	if cfg == nil {
+		return payload, touched
 	}
 	out := payload
-	trackedPath = strings.TrimSpace(trackedPath)
-	trackedPathTouched := false
+
+	markTouched := func(resolvedPath string) {
+		for _, tp := range trackedPaths {
+			tp = strings.TrimSpace(tp)
+			if tp != "" && payloadRuleTargetsPath(resolvedPath, tp) {
+				touched[tp] = true
+			}
+		}
+	}
 
 	// Apply disable-image-generation filtering before payload rules so config payload
 	// overrides can explicitly re-enable image_generation when desired.
@@ -83,7 +116,7 @@ func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, f
 						}
 						out = updated
 						appliedDefaults[resolvedPath] = struct{}{}
-						trackedPathTouched = trackedPathTouched || payloadRuleTargetsPath(resolvedPath, trackedPath)
+						markTouched(resolvedPath)
 					}
 				}
 			}
@@ -115,7 +148,7 @@ func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, f
 						}
 						out = updated
 						appliedDefaults[resolvedPath] = struct{}{}
-						trackedPathTouched = trackedPathTouched || payloadRuleTargetsPath(resolvedPath, trackedPath)
+						markTouched(resolvedPath)
 					}
 				}
 			}
@@ -134,7 +167,7 @@ func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, f
 						var applied bool
 						out, applied = setPayloadValueIfDifferentTracked(out, resolvedPath, value)
 						if applied {
-							trackedPathTouched = trackedPathTouched || payloadRuleTargetsPath(resolvedPath, trackedPath)
+							markTouched(resolvedPath)
 						}
 					}
 				}
@@ -158,7 +191,7 @@ func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, f
 						var applied bool
 						out, applied = setPayloadRawValueIfDifferentTracked(out, resolvedPath, rawValue)
 						if applied {
-							trackedPathTouched = trackedPathTouched || payloadRuleTargetsPath(resolvedPath, trackedPath)
+							markTouched(resolvedPath)
 						}
 					}
 				}
@@ -182,13 +215,20 @@ func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, f
 							continue
 						}
 						out = updated
-						trackedPathTouched = trackedPathTouched || payloadRuleTargetsPath(resolvedPath, trackedPath)
+						markTouched(resolvedPath)
 					}
 				}
 			}
 		}
 	}
-	return out, trackedPathTouched
+	return out, touched
+}
+
+// ApplyPayloadConfigWithRequestTracked applies payload config and reports whether
+// an applied rule targeted trackedPath or one of its descendants.
+func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPath string) ([]byte, bool) {
+	out, touched := ApplyPayloadConfigWithTrackedPaths(cfg, model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers, trackedPath)
+	return out, touched[trackedPath]
 }
 
 func isImagesEndpointRequestPath(path string) bool {
@@ -510,10 +550,10 @@ func buildPayloadPath(root, path string) string {
 }
 
 func payloadRuleTargetsPath(path, trackedPath string) bool {
-	if trackedPath == "" {
+	if trackedPath == "" || path == "" {
 		return false
 	}
-	return path == trackedPath || strings.HasPrefix(path, trackedPath+".")
+	return path == trackedPath || strings.HasPrefix(path, trackedPath+".") || strings.HasPrefix(trackedPath, path+".")
 }
 
 func resolvePayloadRulePaths(payload []byte, path string) []string {

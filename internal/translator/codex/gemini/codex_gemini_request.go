@@ -6,15 +6,14 @@
 package gemini
 
 import (
-	"crypto/rand"
+	"encoding/base64"
 	"fmt"
-	"math/big"
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -36,7 +35,7 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in Codex API format
-func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	// Base template
 	out := []byte(`{"model":"","instructions":"","input":[]}`)
@@ -65,23 +64,14 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		}
 	}
 
-	// helper for generating paired call IDs in the form: call_<alphanum>
+	// helper for generating paired call IDs in the form: call_gemini_<seq>
 	// Gemini uses sequential pairing across possibly multiple in-flight
 	// functionCalls, so we keep a FIFO queue of generated call IDs and
 	// consume them in order when functionResponses arrive.
 	var pendingCallIDs []string
-
-	// genCallID creates a random call id like: call_<8chars>
-	genCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 8 chars random suffix
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
-		}
-		return "call_" + b.String()
-	}
+	callCounter := 0
+	emittedThoughtSignatures := map[string]bool{}
+	signatureTargetModel := translatorcommon.ResolveCodexReplayTargetModel(modelName, inputRawJSON)
 
 	getGeminiCallID := func(value gjson.Result) string {
 		if callID := strings.TrimSpace(value.Get("id").String()); callID != "" {
@@ -151,8 +141,49 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				continue
 			}
 			parr := parts.Array()
+			var pendingThoughtSummaryParts [][]byte
 			for j := 0; j < len(parr); j++ {
 				p := parr[j]
+
+				// A thoughtSignature is replayable reasoning state, not visible
+				// content. Restore it as a reasoning item only when its detected
+				// family matches this request's target model family, so a Muse
+				// (or GPT/Grok) signature can never be replayed to a wrong upstream
+				// through the Gemini ingress. Unmatched signatures fall through to
+				// the existing hidden-thought drop below.
+				if role == "assistant" {
+					if rawSignature := geminiPartThoughtSignature(p); rawSignature != "" {
+						if normalizedSignature, ok := normalizedGeminiThoughtSignatureForCodexTarget(signatureTargetModel, rawSignature); ok && !emittedThoughtSignatures[normalizedSignature] {
+							reasoningItem := []byte(`{"type":"reasoning","encrypted_content":"","summary":[]}`)
+							reasoningItem, _ = sjson.SetBytes(reasoningItem, "encrypted_content", normalizedSignature)
+							summaryParts := pendingThoughtSummaryParts
+							pendingThoughtSummaryParts = nil
+							if translatorcommon.IsGeminiThoughtPart(p) {
+								if thoughtText := p.Get("text").String(); thoughtText != "" {
+									summaryPart := []byte(`{"type":"summary_text","text":""}`)
+									summaryPart, _ = sjson.SetBytes(summaryPart, "text", thoughtText)
+									summaryParts = append(summaryParts, summaryPart)
+								}
+							}
+							if len(summaryParts) > 0 {
+								reasoningItem, _ = sjson.SetRawBytes(reasoningItem, "summary", translatorcommon.JoinRawArray(summaryParts))
+							}
+							inputItems = append(inputItems, reasoningItem)
+							emittedThoughtSignatures[normalizedSignature] = true
+						} else {
+							pendingThoughtSummaryParts = nil
+						}
+					} else if translatorcommon.IsGeminiThoughtPart(p) {
+						if thoughtText := p.Get("text").String(); thoughtText != "" {
+							summaryPart := []byte(`{"type":"summary_text","text":""}`)
+							summaryPart, _ = sjson.SetBytes(summaryPart, "text", thoughtText)
+							pendingThoughtSummaryParts = append(pendingThoughtSummaryParts, summaryPart)
+						}
+					} else {
+						pendingThoughtSummaryParts = nil
+					}
+				}
+
 				if translatorcommon.IsGeminiThoughtPart(p) {
 					continue
 				}
@@ -198,7 +229,8 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					// Reuse gateway-provided IDs when present, otherwise generate one for pairing.
 					id := getGeminiCallID(fc)
 					if id == "" {
-						id = genCallID()
+						callCounter++
+						id = fmt.Sprintf("call_gemini_%016d", callCounter)
 					}
 					fn, _ = sjson.SetBytes(fn, "call_id", id)
 					pendingCallIDs = append(pendingCallIDs, id)
@@ -227,7 +259,8 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						// pop the first element
 						pendingCallIDs = pendingCallIDs[1:]
 					} else {
-						id = genCallID()
+						callCounter++
+						id = fmt.Sprintf("call_gemini_%016d", callCounter)
 					}
 					fno, _ = sjson.SetBytes(fno, "call_id", id)
 					inputItems = append(inputItems, fno)
@@ -352,7 +385,38 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		out, _ = sjson.SetBytes(out, fullPath, normalizedType)
 	}
 
-	return out
+	return out, nil
+}
+
+// geminiPartThoughtSignature extracts a part's thought signature under either
+// the camelCase or snake_case field spelling.
+func geminiPartThoughtSignature(part gjson.Result) string {
+	if signature := strings.TrimSpace(part.Get("thoughtSignature").String()); signature != "" {
+		return signature
+	}
+	return strings.TrimSpace(part.Get("thought_signature").String())
+}
+
+// decodeGeminiCodexThoughtSignature unwraps the carrier written by
+// encodeGeminiCodexThoughtSignature. Values without the carrier magic are
+// returned unchanged, preserving legacy raw-signature echoes.
+func decodeGeminiCodexThoughtSignature(value string) string {
+	value = strings.TrimSpace(value)
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil || !strings.HasPrefix(string(decoded), geminiCodexThoughtSignatureCarrierMagic) {
+		return value
+	}
+	return strings.TrimSpace(strings.TrimPrefix(string(decoded), geminiCodexThoughtSignatureCarrierMagic))
+}
+
+// normalizedGeminiThoughtSignatureForCodexTarget unwraps and normalizes a
+// client-echoed thought signature for the Codex-format upstream serving
+// modelName, returning the exact value that may be written as reasoning
+// encrypted_content. The carrier magic written by
+// encodeGeminiCodexThoughtSignature is stripped first; the family match and
+// normalization rules live in translatorcommon.CodexReplaySignatureForTarget.
+func normalizedGeminiThoughtSignatureForCodexTarget(modelName, rawSignature string) (string, bool) {
+	return translatorcommon.CodexReplaySignatureForTarget(modelName, decodeGeminiCodexThoughtSignature(rawSignature))
 }
 
 func setCodexToolChoiceFromGeminiToolConfig(out []byte, functionCallingConfig gjson.Result) []byte {

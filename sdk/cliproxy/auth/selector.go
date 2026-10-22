@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,18 +18,23 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
+//
+// Rotation continues from the identity of the previous pick rather than from a numeric
+// index. Candidate slices shrink whenever a retry excludes already tried credentials or a
+// credential enters cooldown, and indexing a monotonic counter into a shrinking slice
+// silently re-seats the rotation, which starves some credentials and hammers others.
 type RoundRobinSelector struct {
-	mu      sync.Mutex
-	cursors map[string]int
-	maxKeys int
+	mu         sync.Mutex
+	lastPicked map[string]string
+	maxKeys    int
 }
 
 // WeightedRoundRobinSelector provides smooth weighted round-robin selection.
@@ -79,9 +85,19 @@ type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
 	provider string
+	cause    error
+}
+
+// NewModelCooldownError creates an error representing model-level cooldown.
+func NewModelCooldownError(model, provider string, resetIn time.Duration) error {
+	return newModelCooldownErrorWithCause(model, provider, resetIn, nil)
 }
 
 func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
+	return newModelCooldownErrorWithCause(model, provider, resetIn, nil)
+}
+
+func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duration, cause error) *modelCooldownError {
 	if resetIn < 0 {
 		resetIn = 0
 	}
@@ -89,7 +105,19 @@ func newModelCooldownError(model, provider string, resetIn time.Duration) *model
 		model:    model,
 		provider: provider,
 		resetIn:  resetIn,
+		cause:    cause,
 	}
+}
+
+func (e *modelCooldownError) IsModelCooldown() bool {
+	return true
+}
+
+func (e *modelCooldownError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 func (e *modelCooldownError) Error() string {
@@ -121,12 +149,202 @@ func (e *modelCooldownError) Error() string {
 	if e.provider != "" {
 		errorBody["provider"] = e.provider
 	}
+	if e.cause != nil {
+		if causeText := ExtractUpstreamErrorSummary(e.cause.Error()); causeText != "" {
+			errorBody["last_upstream_error"] = causeText
+			message += fmt.Sprintf(" (last error: %s)", causeText)
+			errorBody["message"] = message
+		}
+	}
 	payload := map[string]any{"error": errorBody}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Sprintf(`{"error":{"code":"model_cooldown","message":"%s"}}`, message)
 	}
 	return string(data)
+}
+
+var (
+	sanitizerSchemeAuthPattern             = regexp.MustCompile(`(?i)((?:[A-Za-z0-9.+_\-]+:)?//)(?:[^:\s/@]+:[^@\s]+|[^@\s/]+)@`)
+	sanitizerQueryParamPattern             = regexp.MustCompile(`(?i)([?&][A-Za-z0-9_.-]*(?:key|token|secret|password|auth|sig|signature)=)[^&\s,\r\n;]+`)
+	sanitizerCookiePattern                 = regexp.MustCompile(`(?i)\b(?:set-)?cookie\s*:[^\r\n]+`)
+	sanitizerAuthHeaderPattern             = regexp.MustCompile(`(?i)\bauthorization\s*[:=]\s*[^\r\n]+`)
+	sanitizerNaturalSecretPattern          = regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:api[ _-]?key|access[ _-]?token|client[ _-]?secret|private[ _-]?key|secret[ _-]?key|password|secret|token|credentials?|sessionid))\s*(?:(?:is|was|provided|used)?\s*[:= ]\s*|\s+is\s+|\s+was\s+|\s+provided\s+|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:[^\r\n;,|]+?(?:\s+(?:and|with|for|via)\s+|[,;|]|\r|\n|$)|[^\r\n;,|]+))`)
+	sanitizerKVPattern                     = regexp.MustCompile(`(?i)((?:'|")?(?:[A-Za-z0-9_.-]*(?:key|token|secret|password|credential|credentials|bearer|sessionid|auth|signature|sig))(?:'|")?\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:[^\r\n;,|]+?(?:\s+(?:and|with|for|via)\s+|[,;|]|\r|\n|$)|[^\r\n;,|]+))`)
+	sanitizerInvalidTokenPattern           = regexp.MustCompile(`(?i)\b(invalid|bad|expired|unknown)\s+(?:api\s+key|access\s+token|refresh\s+token|token|key|secret|password|credentials?|bearer)\s*(?:[:= ]\s*)?(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,\r\n;]+)`)
+	sanitizerSKKeyPattern                  = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9._~+/=-]{6,}|ghp_[A-Za-z0-9._~+/=-]{6,})\b`)
+	sanitizerBearerPattern                 = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+`)
+	sanitizerDoubleQuotedPathPattern       = regexp.MustCompile(`"/[^"\r\n]+"`)
+	sanitizerSingleQuotedPathPattern       = regexp.MustCompile(`'/[^'\r\n]+'`)
+	sanitizerBacktickQuotedPathPattern     = regexp.MustCompile("`/[^`\r\n]+`")
+	sanitizerPathConnectorPattern          = regexp.MustCompile(`(?i)\s+(to|from|into|onto|for|via|with|and)\s+/`)
+	sanitizerUnixPathBeforeColonPattern    = regexp.MustCompile(`(^|[\s\(\[\{<"';,=])(/(?:[^/\s\r\n"',;?#()<>{}\[\]]+(?:\s+[^/\s\r\n"',;?#()<>{}\[\]]+)*/)*[^/:\s\r\n"',;?#()<>{}\[\]]+(?:\s+[^/:\s\r\n"',;?#()<>{}\[\]]+)*):\s+[A-Za-z0-9]`)
+	sanitizerUnixPathBeforeNextPathPattern = regexp.MustCompile(`(^|[\s\(\[\{<"';,=])(/(?:[^/\s\r\n"',;?#()<>{}\[\]]+(?:\s+[^/\s\r\n"',;?#()<>{}\[\]]+)*/)*[^/:\s\r\n"',;?#()<>{}\[\]]+(?::[^/\s\r\n"',;?#()<>{}\[\]]+|\s+[^/:\s\r\n"',;?#()<>{}\[\]]+)*)(\s+/)`)
+	sanitizerUnixPathStandardPattern       = regexp.MustCompile(`(^|[\s\(\[\{<"';,=])(/(?:[^/\s\r\n"',;?#()<>{}\[\]]+(?:\s+[^/\s\r\n"',;?#()<>{}\[\]]+)*/)*[^/:\s\r\n"',;?#()<>{}\[\]]+(?::[^/:\s\r\n"',;?#()<>{}\[\]]+)?)`)
+	sanitizerFileExtPathPattern            = regexp.MustCompile(`(^|[\s"'` + "`" + `(\[,;=])(/[^\s:\r\n"'` + "`" + `,;\])>]+(?:\s+[^\s:\r\n"'` + "`" + `,;\])>]+)*\.(?:json|yaml|yml|key|pem|txt|log|toml|conf|env|crt|cer))`)
+	sanitizerWindowsPathPattern            = regexp.MustCompile(`(?i)\b[A-Za-z]:\\[^\r\n:,;'"<>]+`)
+	sanitizerWindowsUNCPathPattern         = regexp.MustCompile(`\\\\[^\r\n:,;'"<>]+\\[^\r\n:,;'"<>]+`)
+)
+
+// ExtractUpstreamErrorSummary extracts and sanitizes a concise error summary from upstream error strings.
+func ExtractUpstreamErrorSummary(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	jsonPart := raw
+	if idx := strings.Index(raw, ": {"); idx != -1 && idx < 50 {
+		jsonPart = strings.TrimSpace(raw[idx+2:])
+	}
+	if gjson.Valid(jsonPart) {
+		parsed := gjson.Parse(jsonPart)
+		var code, message string
+		if errNode := parsed.Get("error"); errNode.Exists() {
+			if errNode.IsObject() {
+				code = strings.TrimSpace(errNode.Get("code").String())
+				if code == "" {
+					code = strings.TrimSpace(errNode.Get("type").String())
+				}
+				message = strings.TrimSpace(errNode.Get("message").String())
+			} else if errNode.Type == gjson.String {
+				message = strings.TrimSpace(errNode.String())
+			}
+		}
+		if code == "" && message == "" {
+			code = strings.TrimSpace(parsed.Get("code").String())
+			if code == "" {
+				code = strings.TrimSpace(parsed.Get("type").String())
+			}
+			message = strings.TrimSpace(parsed.Get("message").String())
+		}
+		var summary string
+		if code != "" && message != "" {
+			if strings.EqualFold(code, message) || strings.Contains(strings.ToLower(message), strings.ToLower(code)) {
+				summary = message
+			} else {
+				summary = code + ": " + message
+			}
+		} else if message != "" {
+			summary = message
+		} else if code != "" {
+			summary = code
+		}
+		if summary != "" {
+			return SanitizeUpstreamErrorSummary(summary)
+		}
+	}
+	return SanitizeUpstreamErrorSummary(raw)
+}
+
+func sanitizeUpstreamErrorSummaryNoTruncate(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	s = sanitizerSchemeAuthPattern.ReplaceAllString(s, "${1}[REDACTED_AUTH]@")
+	s = sanitizerQueryParamPattern.ReplaceAllString(s, "${1}[REDACTED]")
+	s = sanitizerDoubleQuotedPathPattern.ReplaceAllString(s, `"[REDACTED_PATH]"`)
+	s = sanitizerSingleQuotedPathPattern.ReplaceAllString(s, `'[REDACTED_PATH]'`)
+	s = sanitizerBacktickQuotedPathPattern.ReplaceAllString(s, "`[REDACTED_PATH]`")
+	s = sanitizerWindowsPathPattern.ReplaceAllString(s, "[REDACTED_PATH]")
+	s = sanitizerWindowsUNCPathPattern.ReplaceAllString(s, "[REDACTED_PATH]")
+
+	// Handle connector-separated paths like "copy /tmp/a TO /tmp/b: denied"
+	if loc := sanitizerPathConnectorPattern.FindStringSubmatchIndex(s); loc != nil {
+		firstPart := s[:loc[0]]
+		connRaw := s[loc[0] : loc[1]-1]
+		secondPart := "/" + s[loc[1]:]
+		return sanitizeUpstreamErrorSummaryNoTruncate(firstPart) + connRaw + sanitizeUpstreamErrorSummaryNoTruncate(secondPart)
+	}
+
+	// Handle path before colon error delimiter, finding the first known error or first colon
+	var colonIdx = -1
+	knownErrorPrefixes := []string{
+		"permission denied", "no such file", "file not found", "access denied",
+		"operation not permitted", "denied", "read-only", "is a directory",
+		"not a directory", "cannot find", "no space", "connection refused",
+		"timeout", "failed", "error", "not supported", "invalid argument",
+	}
+	for _, errWord := range knownErrorPrefixes {
+		target := ": " + errWord
+		if idx := strings.Index(strings.ToLower(s), target); idx != -1 {
+			if colonIdx == -1 || idx < colonIdx {
+				colonIdx = idx
+			}
+		}
+	}
+	if colonIdx == -1 {
+		colonIdx = strings.Index(s, ": ")
+	}
+
+	if colonIdx != -1 {
+		prefix := s[:colonIdx]
+		suffix := s[colonIdx:]
+		slashIdx := -1
+		for i := 0; i < len(prefix); i++ {
+			if prefix[i] == '/' {
+				if i > 0 && prefix[i-1] == '/' {
+					continue
+				}
+				if i >= 6 && (strings.HasSuffix(prefix[:i], "http:/") || strings.HasSuffix(prefix[:i], "https:/") || strings.HasSuffix(prefix[:i], "://")) {
+					continue
+				}
+				if i == 0 || prefix[i-1] == ' ' || prefix[i-1] == '\t' || prefix[i-1] == '(' || prefix[i-1] == '[' || prefix[i-1] == '{' || prefix[i-1] == '<' || prefix[i-1] == '"' || prefix[i-1] == '\'' || prefix[i-1] == '`' || prefix[i-1] == '=' {
+					slashIdx = i
+					break
+				}
+			}
+		}
+		if slashIdx != -1 {
+			lead := prefix[:slashIdx]
+			pathPart := prefix[slashIdx:]
+			trailPunct := ""
+			for len(pathPart) > 0 && (pathPart[len(pathPart)-1] == ')' || pathPart[len(pathPart)-1] == ']' || pathPart[len(pathPart)-1] == '}' || pathPart[len(pathPart)-1] == '>') {
+				trailPunct = string(pathPart[len(pathPart)-1]) + trailPunct
+				pathPart = pathPart[:len(pathPart)-1]
+			}
+			if strings.Contains(pathPart, " /") {
+				segments := strings.Split(pathPart, " /")
+				for j := range segments {
+					segments[j] = "[REDACTED_PATH]"
+				}
+				pathPart = strings.Join(segments, " ")
+			} else {
+				pathPart = "[REDACTED_PATH]"
+			}
+			s = lead + pathPart + trailPunct + suffix
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		prev := s
+		s = sanitizerUnixPathStandardPattern.ReplaceAllString(s, "${1}[REDACTED_PATH]")
+		if s == prev {
+			break
+		}
+	}
+	s = sanitizerFileExtPathPattern.ReplaceAllString(s, "${1}[REDACTED_PATH]")
+	s = sanitizerCookiePattern.ReplaceAllString(s, "Cookie: [REDACTED]")
+	s = sanitizerAuthHeaderPattern.ReplaceAllString(s, "Authorization: [REDACTED]")
+	s = sanitizerSKKeyPattern.ReplaceAllString(s, "sk-[REDACTED]")
+	s = sanitizerBearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = sanitizerInvalidTokenPattern.ReplaceAllString(s, `${1} token [REDACTED]`)
+	s = sanitizerNaturalSecretPattern.ReplaceAllString(s, `${1}: [REDACTED]`)
+	s = sanitizerKVPattern.ReplaceAllString(s, `${1}[REDACTED]`)
+	return s
+}
+
+// SanitizeUpstreamErrorSummary removes sensitive credentials, tokens, and paths, and bounds length.
+func SanitizeUpstreamErrorSummary(s string) string {
+	s = sanitizeUpstreamErrorSummaryNoTruncate(s)
+	runes := []rune(s)
+	if len(runes) > 256 {
+		if len(runes) > 253 {
+			return string(runes[:253]) + "..."
+		}
+		return string(runes) + "..."
+	}
+	return s
 }
 
 func (e *modelCooldownError) StatusCode() int {
@@ -261,9 +479,9 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 		}
 		if reason == blockReasonCooldown {
 			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		}
+		if reason != blockReasonDisabled && next.After(now) && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
 	return available, cooldownCount, earliest
@@ -271,6 +489,32 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false)
+}
+
+type prevalidatedAuthCandidatesKey struct{}
+
+func getSelectorAvailableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getSelectorAvailableAuthsWithPriorityMode(ctx, auths, provider, model, now, false)
+}
+
+func getSelectorAvailableAuthsAcrossPriorities(ctx context.Context, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getSelectorAvailableAuthsWithPriorityMode(ctx, auths, provider, model, now, true)
+}
+
+func getSelectorAvailableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, provider, model string, now time.Time, allPriorities bool) ([]*Auth, error) {
+	if ctx != nil {
+		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated && len(auths) > 0 {
+			// The manager already resolved each credential's upstream model and supplied
+			// ID-sorted candidates. Rechecking the alias or an empty model would apply
+			// unrelated cooldowns. Affinity bindings may span all priority tiers, but
+			// fallback selection must still use the highest available tier.
+			if !allPriorities {
+				return highestPriorityAuths(auths), nil
+			}
+			return auths, nil
+		}
+	}
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, allPriorities)
 }
 
 func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -295,7 +539,7 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 			}
 			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, newAuthUnavailableError(earliest, now)
 	}
 
 	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
@@ -371,36 +615,48 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
-	if s.cursors == nil {
-		s.cursors = make(map[string]int)
+	defer s.mu.Unlock()
+	if s.lastPicked == nil {
+		s.lastPicked = make(map[string]string)
 	}
 	limit := s.maxKeys
 	if limit <= 0 {
 		limit = 4096
 	}
 
-	s.ensureCursorKey(key, limit)
-	index := s.cursors[key]
-	if index >= 2_147_483_640 {
-		index = 0
-	}
-	s.cursors[key] = index + 1
-	s.mu.Unlock()
-	return available[index%len(available)], nil
+	s.ensureRotationKey(key, limit)
+	picked := available[successorIndex(available, s.lastPicked[key])]
+	s.lastPicked[key] = picked.ID
+	return picked, nil
 }
 
-// ensureCursorKey ensures the cursor map has capacity for the given key.
+// successorIndex returns the index of the first candidate ordered after lastID, wrapping to
+// the start of the ring. Candidates arrive sorted by ID, so this resumes the rotation at the
+// credential that follows the previous pick even when candidates were filtered out in
+// between. An empty lastID starts at the head.
+func successorIndex(available []*Auth, lastID string) int {
+	if lastID == "" {
+		return 0
+	}
+	index := sort.Search(len(available), func(i int) bool { return available[i].ID > lastID })
+	if index >= len(available) {
+		return 0
+	}
+	return index
+}
+
+// ensureRotationKey ensures the rotation map has capacity for the given key.
 // Must be called with s.mu held.
-func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
-	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
-		s.cursors = make(map[string]int)
+func (s *RoundRobinSelector) ensureRotationKey(key string, limit int) {
+	if _, ok := s.lastPicked[key]; !ok && len(s.lastPicked) >= limit {
+		s.lastPicked = make(map[string]string)
 	}
 }
 
@@ -417,7 +673,7 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
+	available, errAvailable := getSelectorAvailableAuths(ctx, positiveWeightAuths(auths), provider, model, time.Now())
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
@@ -451,23 +707,60 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 	return picked, nil
 }
 
+// maxSmoothWeightedStateEntries bounds a single accumulator map so credentials that are
+// removed permanently cannot leak entries. Real pools stay far below this bound, so the
+// transient subsets produced by retry exclusions and cooldowns are never pruned.
+const maxSmoothWeightedStateEntries = 1024
+
+// prepare syncs the configured weights into the state without discarding accumulated
+// credits. Credits are reset only when a credential's configured weight actually changes,
+// never when the candidate set shrinks temporarily (retry exclusions, cooldowns, session
+// affinity), because discarding credits there would collapse selection onto the first
+// candidate in slice order.
 func (s *smoothWeightedState) prepare(weights map[string]int64) {
-	if s.current == nil || !weightVectorsEqual(s.weights, weights) {
-		s.current = make(map[string]int64)
+	if s.current == nil || weightsConfigChanged(s.weights, weights) {
+		s.current = make(map[string]int64, len(weights))
 	}
-	s.weights = weights
+	if s.weights == nil {
+		s.weights = make(map[string]int64, len(weights))
+	}
+	for authID, weight := range weights {
+		s.weights[authID] = weight
+	}
+	s.pruneStale(weights)
 }
 
-func weightVectorsEqual(left, right map[string]int64) bool {
-	if len(left) != len(right) {
-		return false
+// pruneStale drops entries for credentials outside the current candidate set, but only
+// once a map exceeds the safety bound, so ordinary transient exclusions keep their credits.
+func (s *smoothWeightedState) pruneStale(weights map[string]int64) {
+	if len(s.current) <= maxSmoothWeightedStateEntries && len(s.weights) <= maxSmoothWeightedStateEntries {
+		return
 	}
-	for authID, weight := range left {
-		if right[authID] != weight {
-			return false
+	for authID := range s.current {
+		if _, ok := weights[authID]; !ok {
+			delete(s.current, authID)
 		}
 	}
-	return true
+	for authID := range s.weights {
+		if _, ok := weights[authID]; !ok {
+			delete(s.weights, authID)
+		}
+	}
+}
+
+// weightsConfigChanged reports whether any credential present in both vectors has a
+// different configured weight. Credentials that are merely missing from one side are
+// ignored, since a candidate subset is not a configuration change.
+func weightsConfigChanged(left, right map[string]int64) bool {
+	if len(left) == 0 {
+		return false
+	}
+	for authID, weight := range right {
+		if previous, ok := left[authID]; ok && previous != weight {
+			return true
+		}
+	}
+	return false
 }
 
 func authWeightVector(auths []*Auth) map[string]int64 {
@@ -484,7 +777,6 @@ func authWeightVector(auths []*Auth) map[string]int64 {
 }
 
 func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
-	active := make(map[string]struct{}, len(auths))
 	var picked *Auth
 	var pickedCurrent int64
 	var totalWeight int64
@@ -493,17 +785,11 @@ func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
 		if auth == nil || weight <= 0 {
 			continue
 		}
-		active[auth.ID] = struct{}{}
 		current[auth.ID] = saturatingAddInt64(current[auth.ID], weight)
 		totalWeight = saturatingAddInt64(totalWeight, weight)
 		if picked == nil || current[auth.ID] > pickedCurrent {
 			picked = auth
 			pickedCurrent = current[auth.ID]
-		}
-	}
-	for authID := range current {
-		if _, ok := active[authID]; !ok {
-			delete(current, authID)
 		}
 	}
 	if picked == nil {
@@ -527,7 +813,7 @@ func saturatingAddInt64(value, delta int64) int64 {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -541,6 +827,12 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
+	}
+	if hasUnauthorizedAuthFailure(auth) {
+		return true, blockReasonOther, time.Time{}
+	}
+	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
@@ -580,7 +872,15 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		}
 		return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
 	}
-	return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+	quotaExceeded := auth.Quota.Exceeded
+	// When model is empty and the credential has individual model states, auth.Quota.Exceeded
+	// is an aggregate of single-model quota cooldowns (reason "quota"). As long as the credential
+	// itself is not unavailable (not all models failed) and not under a credential-wide quota,
+	// do not treat individual model cooldowns as blocking the entire credential.
+	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !auth.Unavailable {
+		quotaExceeded = false
+	}
+	return availabilityBlock(auth.Unavailable, quotaExceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
 }
 
 func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
@@ -759,10 +1059,136 @@ func pickGeminiHighestCapacityAuth(candidates []*Auth, model string) *Auth {
 type SessionAffinitySelector struct {
 	mu                   sync.RWMutex
 	stopOnce             sync.Once
-	fallback             Selector
-	cache                *SessionCache
 	strict               bool
 	weeklyQuotaThreshold float64
+	fallback             Selector
+	cache                *SessionCache
+	matcher              *cliproxysession.MerklePrefixMatcher
+	subagentAffinity     bool
+	rebindOnQuotaOnly    bool
+}
+
+const (
+	// SessionAffinityRebindOnAny rebinds the session on any credential-attributed failure (default).
+	SessionAffinityRebindOnAny = "any"
+	// SessionAffinityRebindOnQuota preserves the existing session binding across transient failures
+	// and only rebinds on quota, auth, model-support, or permanent unavailability.
+	SessionAffinityRebindOnQuota = "quota"
+)
+
+func normalizeSessionAffinityRebindOn(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case SessionAffinityRebindOnQuota:
+		return SessionAffinityRebindOnQuota
+	default:
+		return SessionAffinityRebindOnAny
+	}
+}
+
+type sessionAffinityTransientAuthIDsKey struct{}
+
+func withSessionAffinityTransientAuthIDs(ctx context.Context, authIDs map[string]struct{}) context.Context {
+	if len(authIDs) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sessionAffinityTransientAuthIDsKey{}, authIDs)
+}
+
+func sessionAffinityTransientAuthIDsFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	authIDs, _ := ctx.Value(sessionAffinityTransientAuthIDsKey{}).(map[string]struct{})
+	return authIDs
+}
+
+func shouldRebindSessionAffinityOnError(err *Error) bool {
+	if err == nil || shouldSkipCredentialCooldown(err) {
+		return false
+	}
+	if isModelSupportResultError(err) || isCloudflareChallengeResultError(err) || isInvalidGrantResultError(err) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time) bool {
+	if auth == nil {
+		return true
+	}
+	if auth.Disabled || auth.Status == StatusDisabled {
+		return true
+	}
+	if hasUnauthorizedAuthFailure(auth) {
+		return true
+	}
+	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
+		return true
+	}
+	if model != "" && len(auth.ModelStates) > 0 {
+		modelKey := canonicalModelKey(model)
+		for stateModel, state := range auth.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			if state.Status == StatusDisabled {
+				return true
+			}
+			if isStateBlockedByQuotaOrAuth(state.Unavailable, state.Quota, state.NextRetryAfter, state.LastError, now) {
+				return true
+			}
+		}
+		return false
+	}
+	quota := auth.Quota
+	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !auth.Unavailable {
+		quota.Exceeded = false
+	}
+	return isStateBlockedByQuotaOrAuth(auth.Unavailable, quota, auth.NextRetryAfter, auth.LastError, now)
+}
+
+func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAfter time.Time, lastErr *Error, now time.Time) bool {
+	if quota.Exceeded && (quota.NextRecoverAt.IsZero() || quota.NextRecoverAt.After(now)) {
+		return true
+	}
+	blocked, _, _ := availabilityBlock(unavailable, quota.Exceeded, nextRetryAfter, quota.NextRecoverAt, now)
+	if !blocked {
+		return lastErr != nil && shouldRebindSessionAffinityOnError(lastErr)
+	}
+	if lastErr != nil {
+		return shouldRebindSessionAffinityOnError(lastErr)
+	}
+	return nextRetryAfter.IsZero() && quota.NextRecoverAt.IsZero()
+}
+
+func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx context.Context, candidates []*Auth, model, authID string, now time.Time) bool {
+	if s == nil || !s.rebindOnQuotaOnly || authID == "" {
+		return false
+	}
+	if ctx != nil {
+		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
+			transientAuthIDs := sessionAffinityTransientAuthIDsFromContext(ctx)
+			_, ok := transientAuthIDs[authID]
+			return ok
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.ID == authID {
+			return !isAuthBlockedByQuotaOrAuthForModel(candidate, model, now)
+		}
+	}
+	return false
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -772,6 +1198,8 @@ type SessionAffinityConfig struct {
 	TTL                  time.Duration
 	Store                SessionBindingStore
 	WeeklyQuotaThreshold float64
+	SubagentAffinity     *bool
+	RebindOn             string
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -798,17 +1226,32 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if threshold <= 0 {
 		threshold = DefaultWeeklyQuotaThreshold
 	}
+	subagentAffinity := true
+	if cfg.SubagentAffinity != nil {
+		subagentAffinity = *cfg.SubagentAffinity
+	}
+	rebindOnQuotaOnly := normalizeSessionAffinityRebindOn(cfg.RebindOn) == SessionAffinityRebindOnQuota
 	return &SessionAffinitySelector{
 		fallback:             cfg.Fallback,
 		cache:                cache,
 		strict:               cfg.Strict,
 		weeklyQuotaThreshold: threshold,
+		matcher:              cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
+		subagentAffinity:     subagentAffinity,
+		rebindOnQuotaOnly:    rebindOnQuotaOnly,
 	}
+}
+
+// Trees returns a backward-compatible in-memory session tree store.
+// Deprecated: Session tree management has moved to Home.
+func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeStore {
+	return cliproxysession.NewInMemorySessionTreeStore(0, time.Hour)
 }
 
 // Pick selects an auth with session affinity when possible.
 // Explicit Claude Code, Codex, OpenCode, pi, and request-body session signals
-// precede execution metadata, stable derived identity, and the legacy hash fallback.
+// are absolute authority. Requests without those signals use the Merkle LCP
+// matcher before retaining the legacy derived/hash fallback behavior.
 //
 // An established binding outranks credential priority: a bound credential that is still
 // available is reused even when a higher-priority credential recovers. Credential priority
@@ -822,6 +1265,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	s.mu.RLock()
 	fallback, strict, weeklyThreshold := s.fallback, s.strict, s.weeklyQuotaThreshold
 	defer s.mu.RUnlock()
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
 	if weeklyThreshold <= 0 {
 		weeklyThreshold = DefaultWeeklyQuotaThreshold
 	}
@@ -831,14 +1277,49 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+
+	// Explicit harness identities are absolute authority. The LCP matcher is only
+	// consulted when no header, body, or execution-session identity is present.
+	explicitID, explicitFallbackID := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if explicitID == "" && !strict {
+		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry); handled || errLCP != nil {
+			return auth, errLCP
+		}
+	} else if opts.Metadata != nil {
+		delete(opts.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey)
+		delete(opts.Metadata, cliproxyexecutor.LCPAccessGenerationMetadataKey)
+		delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+		delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+		if explicitFallbackID != "" {
+			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(explicitFallbackID)
+		} else {
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+		}
+		if isFork, ok := opts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); !ok || !isFork {
+			delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+		}
+	}
+
+	primaryID, fallbackID := explicitID, explicitFallbackID
+	if primaryID == "" {
+		primaryID, fallbackID = extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	}
+	if primaryID != "" {
+		primaryID = cliproxysession.BoundSessionIdentity(primaryID)
+		if fallbackID != "" {
+			fallbackID = cliproxysession.BoundSessionIdentity(fallbackID)
+		}
+		if opts.Metadata != nil {
+			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = primaryID
+		}
+	}
 	now := time.Now()
 	availabilityCandidates := auths
 	if _, weighted := fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getAvailableAuths(availabilityCandidates, provider, model, now)
+		fallbackAuths, errAvailable := getSelectorAvailableAuths(ctx, availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
@@ -851,7 +1332,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	// A single availability pass serves both lookups: the bound credential is validated against
 	// every priority tier, while the fallback selector keeps seeing only the highest tier.
-	available, err := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now)
+	available, err := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -860,36 +1341,55 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
+	isFork := false
+	if opts.Metadata != nil {
+		if forkFlag, ok := opts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); ok && forkFlag {
+			isFork = true
+		}
+	}
+	isSubagent := !isFork && isSubagentSession(primaryID, fallbackID)
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
 	var isFailover bool
-	bind := func(authID string) error {
+	bind := func(authID string, recordSelection ...bool) error {
+		keys := []string{cacheKey}
+		prefixes := []string{provider + "::" + primaryID + "::"}
+		if fallbackKey != "" && !isSubagent && !isFork {
+			keys = append(keys, fallbackKey)
+			prefixes = append(prefixes, provider+"::"+fallbackID+"::")
+		}
+		var errBind error
 		if strict {
-			prefixes := []string{provider + "::" + primaryID + "::"}
-			if fallbackKey != "" {
-				prefixes = append(prefixes, provider+"::"+fallbackID+"::")
-			}
 			if isFailover {
-				if fallbackKey != "" {
-					return s.cache.RebindAliasesStrictForPrefixes(authID, prefixes, cacheKey, fallbackKey)
+				errBind = s.cache.RebindAliasesStrictForPrefixes(authID, prefixes, keys...)
+			} else {
+				errBind = s.cache.BindAliasesStrictForPrefixes(authID, prefixes, keys...)
+			}
+		} else {
+			errBind = s.cache.BindAliases(authID, keys...)
+		}
+		if errBind != nil {
+			return errBind
+		}
+		if len(recordSelection) == 0 || recordSelection[0] {
+			bindingProvider := canonicalSchedulingProvider(provider)
+			for _, candidate := range auths {
+				if candidate != nil && candidate.ID == authID {
+					if p := canonicalSchedulingProvider(executorKeyFromAuth(candidate)); p != "" {
+						bindingProvider = p
+					}
+					break
 				}
-				return s.cache.RebindAliasesStrictForPrefixes(authID, prefixes, cacheKey)
 			}
-			if fallbackKey != "" {
-				return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey, fallbackKey)
-			}
-			return s.cache.BindAliasesStrictForPrefixes(authID, prefixes, cacheKey)
+			s.cache.recordSessionSelection(authID, bindingProvider, primaryID, keys...)
 		}
-		if fallbackKey != "" {
-			return s.cache.BindAliases(authID, cacheKey, fallbackKey)
-		}
-		return s.cache.BindAliases(authID, cacheKey)
+		return nil
 	}
 	var strictSessionAuthID string
 	var strictSessionFound bool
-	if strict {
+	if strict && !isSubagent && !isFork {
 		for _, sessionID := range []string{primaryID, fallbackID} {
 			if sessionID == "" {
 				continue
@@ -924,15 +1424,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					isFailover = true
 					break
 				}
-				aliasesReady := fallbackKey == ""
-				if !aliasesReady {
-					fallbackAuthID, fallbackFound := s.cache.Get(fallbackKey)
-					aliasesReady = fallbackFound && fallbackAuthID == auth.ID
-				}
-				if !aliasesReady {
-					if errBind := bind(auth.ID); errBind != nil {
-						return nil, sessionAffinityBindError(errBind)
-					}
+				if errBind := bind(auth.ID, true); errBind != nil {
+					return nil, sessionAffinityBindError(errBind)
 				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
@@ -957,6 +1450,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		if err != nil {
 			return nil, err
+		}
+		if auth == nil {
+			return nil, nil
+		}
+		if !strict && !isFailover && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
+			if errBind := bind(cachedAuthID, false); errBind != nil {
+				return nil, sessionAffinityBindError(errBind)
+			}
+			entry.Infof("session-affinity: cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+			return auth, nil
 		}
 		if errBind := bind(auth.ID); errBind != nil {
 			return nil, sessionAffinityBindError(errBind)
@@ -990,7 +1493,32 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		isFailover = true
 	}
 
-	if fallbackKey != "" && !isFailover {
+	if isSubagent && s.subagentAffinity && isGuardianRequest(opts.Headers) {
+		providers := make(map[string]struct{})
+		schedulingProvider := canonicalSchedulingProvider(provider)
+		for _, candidate := range available {
+			candidateProvider := canonicalSchedulingProvider(executorKeyFromAuth(candidate))
+			if candidateProvider == "" {
+				candidateProvider = schedulingProvider
+			}
+			if schedulingProvider == "mixed" || candidateProvider == schedulingProvider {
+				providers[candidateProvider] = struct{}{}
+			}
+		}
+		if parentAuthID := s.cache.latestSessionAuth(fallbackID, providers); parentAuthID != "" {
+			for _, auth := range available {
+				if auth.ID == parentAuthID {
+					if errBind := bind(auth.ID, true); errBind != nil {
+						return nil, sessionAffinityBindError(errBind)
+					}
+					entry.Infof("session-affinity: guardian inherited parent binding | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					return auth, nil
+				}
+			}
+		}
+	}
+
+	if fallbackKey != "" && !isFailover && (!isSubagent || s.subagentAffinity) {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
@@ -1007,7 +1535,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					return auth, nil
 				}
 			}
-			if strict {
+			if strict && !isSubagent && !isFork {
 				if !isStrictFailoverAllowedWithThreshold(availabilityCandidates, cachedAuthID, model, weeklyThreshold, now) {
 					return nil, strictSessionAuthUnavailableError()
 				}
@@ -1020,7 +1548,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	eligibleColdBindingAuths := FilterAuthsAboveWeeklyQuotaThreshold(coldBindingAuths, weeklyThreshold, now)
 	eligibleFallbackAuths := FilterAuthsAboveWeeklyQuotaThreshold(fallbackAuths, weeklyThreshold, now)
 	var auth *Auth
-	if isGeminiOrAntigravity(provider, model) {
+	if isGeminiOrAntigravity(provider, model) && s.subagentAffinity {
 		auth = pickGeminiHighestCapacityAuth(eligibleFallbackAuths, model)
 		if auth == nil {
 			err = &Error{Code: "auth_unavailable", Message: "no available auth for gemini"}
@@ -1030,6 +1558,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	if err != nil {
 		return nil, err
+	}
+	if auth == nil {
+		return nil, nil
 	}
 	if errBind := bind(auth.ID); errBind != nil {
 		return nil, sessionAffinityBindError(errBind)
@@ -1102,7 +1633,14 @@ func (s *SessionAffinitySelector) Reconfigured(fallback Selector, strict bool, t
 		s.cache.SetStrict(strict)
 		s.cache.retain()
 	}
-	return &SessionAffinitySelector{fallback: fallback, cache: s.cache, strict: strict}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return &SessionAffinitySelector{
+		fallback: fallback, cache: s.cache, strict: strict,
+		weeklyQuotaThreshold: s.weeklyQuotaThreshold,
+		matcher:              cliproxysession.NewMerklePrefixMatcher(ttl),
+		subagentAffinity:     s.subagentAffinity, rebindOnQuotaOnly: s.rebindOnQuotaOnly,
+	}
 }
 
 func (s *SessionAffinitySelector) ReconfigureInPlace(fallback Selector, strict bool, ttl time.Duration) error {
@@ -1176,6 +1714,226 @@ func sessionAffinityStoreUnavailableError() *Error {
 	}
 }
 
+func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
+	if s == nil || s.matcher == nil {
+		return nil, false, nil
+	}
+	namespace := lcpAffinityNamespace(provider, model, opts.Metadata)
+	if namespace == "" {
+		return nil, false, nil
+	}
+	turns := cliproxysession.ExtractCanonicalTurns(opts.SourceFormat, opts.OriginalRequest)
+	if len(turns) == 0 {
+		return nil, false, nil
+	}
+	fingerprints, minPrefixLength, tailFingerprints, envDigest := s.matcher.PrepareExt(turns)
+	if len(fingerprints) == 0 || minPrefixLength <= 0 || minPrefixLength > len(fingerprints) {
+		return nil, false, nil
+	}
+	if opts.Metadata != nil {
+		opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey] = fingerprints
+		opts.Metadata[cliproxyexecutor.LCPMinPrefixLengthMetadataKey] = minPrefixLength
+		opts.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey] = tailFingerprints
+		opts.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey] = envDigest
+	}
+
+	availabilityCandidates := auths
+	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
+		availabilityCandidates = positiveWeightAuths(auths)
+	}
+	now := time.Now()
+	available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
+	if errAvailable != nil {
+		return nil, true, errAvailable
+	}
+
+	var preservedAuthID string
+	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
+		for _, auth := range available {
+			if auth == nil || auth.ID != match.AuthID {
+				continue
+			}
+			if match.SessionID != "" {
+				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
+				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+			}
+			if match.ParentSessionID != "" {
+				opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = match.ParentSessionID
+			} else if opts.Metadata != nil {
+				delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+			}
+			if match.AccessNumber > 0 && opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = match.AccessNumber
+			}
+			if match.IsFork {
+				if opts.Metadata != nil {
+					opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
+				}
+				entry.Infof("session-affinity: LCP fork hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
+			} else if match.IsCompaction {
+				if opts.Metadata != nil {
+					opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+				}
+				entry.Infof("session-affinity: LCP compaction hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
+			} else {
+				if opts.Metadata != nil {
+					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+					delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+				}
+				entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
+			}
+			return auth, true, nil
+		}
+		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
+			preservedAuthID = match.AuthID
+		}
+	}
+
+	fallbackAuths := highestPriorityAuths(available)
+	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	if errPick != nil {
+		return nil, true, errPick
+	}
+	if auth == nil {
+		return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	bindAuthID := auth.ID
+	if preservedAuthID != "" {
+		bindAuthID = preservedAuthID
+	}
+	if bindRes := s.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, bindAuthID); bindRes.SessionID != "" {
+		opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
+		opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
+		if bindRes.ParentSessionID != "" {
+			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = bindRes.ParentSessionID
+		} else if opts.Metadata != nil {
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+		}
+		if bindRes.AccessNumber > 0 && opts.Metadata != nil {
+			opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = bindRes.AccessNumber
+		}
+		if preservedAuthID != "" {
+			if bindRes.IsCompaction {
+				if opts.Metadata != nil {
+					opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+				}
+			} else if opts.Metadata != nil {
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+			}
+			entry.Infof("session-affinity: LCP cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), preservedAuthID, auth.ID, provider, model)
+		} else if bindRes.IsFork {
+			if opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
+			}
+			entry.Infof("session-affinity: LCP fork bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), truncateSessionID(bindRes.ParentSessionID), auth.ID, provider, model)
+		} else if bindRes.IsCompaction {
+			if opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+			}
+			entry.Infof("session-affinity: LCP compaction bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), truncateSessionID(bindRes.ParentSessionID), auth.ID, provider, model)
+		} else {
+			if opts.Metadata != nil {
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+			}
+			entry.Infof("session-affinity: LCP cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), auth.ID, provider, model)
+		}
+	}
+	return auth, true, nil
+}
+
+func canonicalLCPProvider(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	switch provider {
+	case "google", "gemini", "vertex", "aistudio":
+		return "google"
+	case "codex", "openai":
+		return "openai"
+	case "claude", "anthropic":
+		return "claude"
+	case "devin":
+		return "devin"
+	default:
+		return provider
+	}
+}
+
+func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
+	provider = canonicalLCPProvider(provider)
+	model = canonicalModelKey(model)
+	callerScope := sessionMetadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	if provider == "" || callerScope == "" {
+		return ""
+	}
+	return strings.Join([]string{"lcp:v1", provider, model, callerScope}, "::")
+}
+
+func parseLCPNamespace(ns string) (provider, model, callerScope string, ok bool) {
+	if !strings.HasPrefix(ns, "lcp:v1::") {
+		return "", "", "", false
+	}
+	rest := strings.TrimPrefix(ns, "lcp:v1::")
+	nsProvider, rest, found := strings.Cut(rest, "::")
+	if !found {
+		return "", "", "", false
+	}
+	lastIdx := strings.LastIndex(rest, "::")
+	if lastIdx < 0 {
+		return nsProvider, rest, "", true
+	}
+	nsModel := rest[:lastIdx]
+	nsCallerScope := rest[lastIdx+2:]
+	return nsProvider, nsModel, nsCallerScope, true
+}
+
+func lcpFingerprintsFromMetadata(metadata map[string]any) ([]string, int) {
+	if metadata == nil {
+		return nil, 0
+	}
+	rawFingerprints, ok := metadata[cliproxyexecutor.LCPFingerprintMetadataKey]
+	if !ok || rawFingerprints == nil {
+		return nil, 0
+	}
+	var fingerprints []string
+	switch v := rawFingerprints.(type) {
+	case []string:
+		fingerprints = v
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				fingerprints = append(fingerprints, s)
+			}
+		}
+	}
+	minPrefixLength, _ := metadata[cliproxyexecutor.LCPMinPrefixLengthMetadataKey].(int)
+	return fingerprints, minPrefixLength
+}
+
+func sessionMetadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
 func selectorLogEntry(ctx context.Context) *log.Entry {
 	if ctx == nil {
 		return log.NewEntry(log.StandardLogger())
@@ -1203,6 +1961,9 @@ func (s *SessionAffinitySelector) Stop() {
 		if s.cache != nil {
 			s.cache.release()
 		}
+		if s.matcher != nil {
+			s.matcher.Clear()
+		}
 	})
 }
 
@@ -1217,20 +1978,126 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if !s.strict {
 		s.cache.InvalidateAuth(authID)
 	}
+	if s.matcher != nil {
+		s.matcher.InvalidateAuth(authID)
+	}
+}
+
+// LookupAffinity observes the current session affinity binding without side effects.
+// It never selects a credential, creates a binding, rebinds, or refreshes TTL.
+// Optional authFilters allow callers (such as Manager) to exclude credentials that do not match the requested provider.
+func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID string, authFilters ...func(authID string) bool) (string, string) {
+	if s == nil || s.cache == nil {
+		return "", "unsupported"
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	sessionID = strings.TrimSpace(sessionID)
+	if provider == "" || model == "" || sessionID == "" {
+		return "", "unbound"
+	}
+
+	var authFilter func(authID string) bool
+	if len(authFilters) > 0 {
+		authFilter = authFilters[0]
+	}
+
+	modelKey := canonicalModelKey(model)
+	if modelKey == "" {
+		modelKey = model
+	}
+
+	providers := []string{provider}
+	if provider != "mixed" {
+		providers = append(providers, "mixed")
+	}
+
+	candidatePrefixes := cliproxysession.CandidateSessionPrefixes
+	hasKnownPrefix := false
+	for _, p := range candidatePrefixes {
+		if strings.HasPrefix(sessionID, p) {
+			hasKnownPrefix = true
+			break
+		}
+	}
+
+	var candidates []string
+	if hasKnownPrefix {
+		candidates = []string{sessionID}
+	} else {
+		candidates = make([]string, 0, len(candidatePrefixes)+1)
+		candidates = append(candidates, sessionID)
+		for _, p := range candidatePrefixes {
+			candidates = append(candidates, p+sessionID)
+		}
+	}
+
+	foundAuths := make(map[string]struct{})
+	for _, candProvider := range providers {
+		for _, cand := range candidates {
+			bounded := cliproxysession.BoundSessionIdentity(cand)
+			key := candProvider + "::" + bounded + "::" + modelKey
+			if authID, ok := s.cache.Get(key); ok && authID != "" {
+				if authFilter != nil && !authFilter(authID) {
+					continue
+				}
+				foundAuths[authID] = struct{}{}
+			}
+		}
+	}
+
+	if s.matcher != nil {
+		for _, cand := range candidates {
+			if authIDs, ns, ok := s.matcher.LookupSession(cand); ok && len(authIDs) > 0 {
+				nsProvider, nsModel, _, okParse := parseLCPNamespace(ns)
+				matchesNS := true
+				if okParse {
+					reqProvider := canonicalLCPProvider(provider)
+					canonicalNSProvider := canonicalLCPProvider(nsProvider)
+					if (provider != "mixed" && nsProvider != "mixed" && canonicalNSProvider != reqProvider) ||
+						(modelKey != "" && nsModel != modelKey) {
+						matchesNS = false
+					}
+				}
+				if matchesNS {
+					for _, aID := range authIDs {
+						if authFilter != nil && !authFilter(aID) {
+							continue
+						}
+						foundAuths[aID] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	if len(foundAuths) == 0 {
+		return "", "unbound"
+	}
+	if len(foundAuths) > 1 {
+		return "", "ambiguous"
+	}
+	for authID := range foundAuths {
+		return authID, "bound"
+	}
+	return "", "unbound"
 }
 
 // OnResult handles session affinity binding or release based on execution outcome.
 func (s *SessionAffinitySelector) OnResult(res Result) {
-	if s == nil || s.cache == nil || res.AuthID == "" {
+	if s == nil || res.AuthID == "" {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
-	if primaryID == "" && fallbackID == "" {
-		return
-	}
 
+	explicitID, explicitFallbackID := extractExplicitSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
+	if explicitID != "" {
+		explicitID = cliproxysession.BoundSessionIdentity(explicitID)
+		if explicitFallbackID != "" {
+			explicitFallbackID = cliproxysession.BoundSessionIdentity(explicitFallbackID)
+		}
+	}
 	ns := res.Provider
 	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
 		ns = raw
@@ -1241,10 +2108,77 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 
 	effectiveStrict := s.strict && !isGeminiOrAntigravity(ns, nsModel)
+	if res.Error != nil && shouldSkipCredentialCooldown(res.Error) {
+		// Request-scoped or caller-attributed failures are not evidence that the
+		// selected credential is unhealthy, so preserve both explicit and LCP bindings.
+		return
+	}
+	if !res.Success && s.rebindOnQuotaOnly && !shouldRebindSessionAffinityOnError(res.Error) {
+		// Under session-affinity-rebind-on: quota, transient failures fail over for
+		// the current request without unbinding the session from its bound credential.
+		return
+	}
+
+	// LCP bindings are independent from explicit harness bindings. A successful
+	// extension is recorded as a new sequence while credential-attributed failures
+	// only remove the exact sequence that was attempted.
+	if explicitID == "" && s.matcher != nil {
+		if namespace := lcpAffinityNamespace(ns, nsModel, res.Options.Metadata); namespace != "" {
+			fingerprints, minPrefixLength := lcpFingerprintsFromMetadata(res.Options.Metadata)
+			tailFingerprints, _ := res.Options.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey].([]string)
+			envDigest, _ := res.Options.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey].(string)
+			if len(fingerprints) == 0 {
+				turns := cliproxysession.ExtractCanonicalTurns(res.Options.SourceFormat, res.Options.OriginalRequest)
+				fingerprints, minPrefixLength, tailFingerprints, envDigest = s.matcher.PrepareExt(turns)
+			}
+			if len(fingerprints) > 0 && minPrefixLength > 0 && minPrefixLength <= len(fingerprints) {
+				if res.Success {
+					s.matcher.TouchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, res.AuthID)
+				} else {
+					var generation uint64
+					if res.Options.Metadata != nil {
+						if gen, ok := res.Options.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey].(uint64); ok {
+							generation = gen
+						}
+					}
+					if !s.matcher.RemoveFingerprintsBefore(namespace, fingerprints, res.AuthID, generation) && res.Options.Metadata != nil {
+						isFork, _ := res.Options.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool)
+						if !isFork {
+							if lcpSessionID := sessionMetadataString(res.Options.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey); lcpSessionID != "" {
+								s.matcher.RemoveSessionBefore(namespace, lcpSessionID, res.AuthID, generation)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if s.cache == nil {
+		return
+	}
+	if explicitID == "" && s.matcher != nil && res.Options.Metadata != nil {
+		if _, isLCP := res.Options.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey]; isLCP {
+			return
+		}
+	}
+	primaryID, fallbackID := explicitID, explicitFallbackID
+	if primaryID == "" {
+		primaryID, fallbackID = extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
+	}
+	if primaryID == "" && fallbackID == "" {
+		return
+	}
+	if primaryID != "" {
+		primaryID = cliproxysession.BoundSessionIdentity(primaryID)
+	}
+	if fallbackID != "" {
+		fallbackID = cliproxysession.BoundSessionIdentity(fallbackID)
+	}
 
 	cacheKey := ns + "::" + primaryID + "::" + nsModel
 	var fallbackKey string
-	if fallbackID != "" && fallbackID != primaryID {
+	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
@@ -1359,6 +2293,16 @@ func (s *SessionAffinitySelector) ExtendBinding(authID, provider, model string, 
 	return strictSessionBindingConflictError()
 }
 
+// isGuardianRequest deliberately matches the header, not the configurable review model.
+func isGuardianRequest(headers http.Header) bool {
+	for key, values := range headers {
+		if strings.EqualFold(key, "X-Openai-Subagent") && len(values) > 0 {
+			return strings.EqualFold(strings.TrimSpace(values[0]), "guardian")
+		}
+	}
+	return false
+}
+
 // normalizedSessionCandidate validates an explicit client-provided session signal.
 // It keeps opaque printable IDs intact while rejecting values that are unsafe or
 // implausibly large for routing keys and logs.
@@ -1366,24 +2310,30 @@ func normalizedSessionCandidate(raw string) string {
 	return cliproxysession.NormalizeExplicitID(raw)
 }
 
-func sessionHeaderValue(headers http.Header, name string) string {
-	if headers == nil {
-		return ""
+func isSubagentSession(primaryID, fallbackID string) bool {
+	if strings.Contains(primaryID, ":agent:") {
+		return true
 	}
-	if value := normalizedSessionCandidate(headers.Get(name)); value != "" {
-		return value
+	if fallbackID == "" || primaryID == "" || primaryID == fallbackID {
+		return false
 	}
-	for key, values := range headers {
-		if !strings.EqualFold(key, name) {
-			continue
+	return isHierarchyParent(primaryID, fallbackID)
+}
+
+// CanonicalSessionID resolves the single authoritative session identity from request options and metadata.
+func CanonicalSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
+	if explicitID, _ := extractExplicitSessionIDs(headers, payload, metadata); explicitID != "" {
+		return cliproxysession.BoundSessionIdentity(explicitID)
+	}
+	if metadata != nil {
+		if canonicalID, ok := metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string); ok && strings.TrimSpace(canonicalID) != "" {
+			return cliproxysession.BoundSessionIdentity(strings.TrimSpace(canonicalID))
 		}
-		for _, raw := range values {
-			if value := normalizedSessionCandidate(raw); value != "" {
-				return value
-			}
+		if lcpID, ok := metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string); ok && strings.TrimSpace(lcpID) != "" {
+			return cliproxysession.BoundSessionIdentity(strings.TrimSpace(lcpID))
 		}
 	}
-	return ""
+	return cliproxysession.BoundSessionIdentity(ExtractSessionID(headers, payload, metadata))
 }
 
 // ExtractSessionID extracts a session identifier from explicit client signals,
@@ -1406,73 +2356,62 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 	return primary
 }
 
+func extractConversationAlias(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	root := gjson.ParseBytes(payload)
+	conversation := root.Get("conversation")
+	if !conversation.Exists() {
+		req := root.Get("request")
+		if req.Exists() && !root.Get("contents").Exists() {
+			conversation = req.Get("conversation")
+		}
+	}
+	if sid := normalizedSessionCandidate(conversation.Get("id").String()); sid != "" {
+		return "conv:" + sid
+	} else if conversation.Type == gjson.String {
+		if sid := normalizedSessionCandidate(conversation.String()); sid != "" {
+			return "conv:" + sid
+		}
+	}
+	return ""
+}
+
+// extractExplicitSessionIDs returns only client- or execution-provided identities.
+// LCP fallback must run after this function so explicit harness sessions remain authoritative.
+func extractExplicitSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	info, ok := cliproxysession.ExtractSessionInfo(headers, payload, metadata)
+	if !ok || info.ClientType == "lcp" {
+		if alias := responseSessionAlias(payload); alias != "" {
+			return alias, ""
+		}
+		return "", ""
+	}
+	if metadata != nil {
+		if info.IsFork {
+			metadata[cliproxyexecutor.IsForkMetadataKey] = true
+		}
+		if info.ParentSessionID != "" {
+			metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = info.ParentSessionID
+		}
+	}
+	fallback := info.ParentSessionID
+	if fallback == "" {
+		fallback = responseSessionAlias(payload)
+	}
+	if fallback == "" && strings.HasPrefix(info.SessionID, "pck:") && len(payload) > 0 {
+		fallback = extractConversationAlias(payload)
+	}
+	return info.SessionID, fallback
+}
+
 // extractSessionIDs returns (primaryID, fallbackID) for session affinity.
 // fallbackID preserves an earlier binding when a stronger body identifier appears
 // later, and lets callers bind both identifiers when both are present.
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	previousResponseAlias := responseSessionAlias(payload)
-	if sid := sessionHeaderValue(headers, "X-Claude-Code-Session-Id"); sid != "" {
-		return "claude:" + sid, ""
-	}
-	if sid := cliproxysession.ClaudeMetadataSessionID(payload); sid != "" {
-		return "claude:" + sid, ""
-	}
-	if sid := sessionHeaderValue(headers, "Session-Id"); sid != "" {
-		return "codex:" + sid, previousResponseAlias
-	}
-	if sid := sessionHeaderValue(headers, "Session_id"); sid != "" {
-		return "codex:" + sid, previousResponseAlias
-	}
-	if sid := sessionHeaderValue(headers, "X-Session-ID"); sid != "" {
-		return "header:" + sid, ""
-	}
-	if sid := sessionHeaderValue(headers, "X-Session-Affinity"); sid != "" {
-		return "affinity:" + sid, ""
-	}
-	if sid := sessionHeaderValue(headers, "X-Client-Request-Id"); sid != "" {
-		return "clientreq:" + sid, ""
-	}
-	if len(payload) > 0 {
-		for _, path := range []string{"session_id", "sessionId"} {
-			if sid := normalizedSessionCandidate(gjson.GetBytes(payload, path).String()); sid != "" {
-				return "session:" + sid, previousResponseAlias
-			}
-		}
-
-		conversationID := ""
-		conversation := gjson.GetBytes(payload, "conversation")
-		if sid := normalizedSessionCandidate(conversation.Get("id").String()); sid != "" {
-			conversationID = "conv:" + sid
-		} else if conversation.Type == gjson.String {
-			if sid := normalizedSessionCandidate(conversation.String()); sid != "" {
-				conversationID = "conv:" + sid
-			}
-		}
-		if sid := normalizedSessionCandidate(gjson.GetBytes(payload, "prompt_cache_key").String()); sid != "" {
-			if previousResponseAlias != "" {
-				return "pck:" + sid, previousResponseAlias
-			}
-			return "pck:" + sid, conversationID
-		}
-		if conversationID != "" {
-			return conversationID, previousResponseAlias
-		}
-		if previousResponseAlias != "" {
-			return previousResponseAlias, ""
-		}
-
-		if userID := normalizedSessionCandidate(gjson.GetBytes(payload, "metadata.user_id").String()); userID != "" {
-			return "user:" + userID, ""
-		}
-		if conversationID := normalizedSessionCandidate(gjson.GetBytes(payload, "conversation_id").String()); conversationID != "" {
-			return "conv:" + conversationID, ""
-		}
-	}
-
-	if executionID, ok := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok {
-		if executionID = normalizedSessionCandidate(executionID); executionID != "" {
-			return "execution:" + executionID, ""
-		}
+	if primaryID, fallbackID := extractExplicitSessionIDs(headers, payload, metadata); primaryID != "" {
+		return primaryID, fallbackID
 	}
 	if derivedID := normalizedSessionCandidate(cliproxysession.DerivedID(metadata)); derivedID != "" {
 		return "derived:" + derivedID, ""
@@ -1653,7 +2592,7 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 		}
 	}
 
-	if systemPrompt == "" && firstUserMsg == "" {
+	if firstUserMsg == "" {
 		return "", ""
 	}
 

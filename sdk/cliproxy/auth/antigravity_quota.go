@@ -12,7 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 const (
@@ -89,7 +90,7 @@ func refreshAntigravityTokenDirect(ctx context.Context, refreshToken, proxyURL s
 		return "", errReq
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "antigravity/cli/1.0.13")
+	req.Header.Set("User-Agent", misc.AntigravityUserAgent())
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	if proxyURL != "" {
@@ -151,7 +152,7 @@ func fetchAntigravityQuota(ctx context.Context, auth *Auth, proxyURL string) (An
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", misc.AntigravityUserAgent())
 		return client.Do(req)
 	}
 

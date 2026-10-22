@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	log "github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/tidwall/gjson"
@@ -122,7 +123,7 @@ func TestConvertClaudeRequestToAntigravity_StripsClaudeCodeAttribution(t *testin
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	parts := gjson.Get(outputStr, "request.systemInstruction.parts").Array()
@@ -145,7 +146,7 @@ func TestConvertClaudeRequestToAntigravity_ConvertsMessageSystemRoleToUserConten
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3-flash-agent", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3-flash-agent", inputJSON, false)
 	outputStr := string(output)
 
 	if systemContent := gjson.Get(outputStr, `request.contents.#(role=="system")`); systemContent.Exists() {
@@ -153,31 +154,146 @@ func TestConvertClaudeRequestToAntigravity_ConvertsMessageSystemRoleToUserConten
 	}
 
 	contents := gjson.Get(outputStr, "request.contents").Array()
-	if len(contents) != 3 {
-		t.Fatalf("Expected the user and message-level system turns in request.contents, got %d: %s", len(contents), gjson.Get(outputStr, "request.contents").Raw)
+	if len(contents) != 1 {
+		t.Fatalf("Expected consecutive user and message-level system turns to be merged into a single user turn, got %d: %s", len(contents), gjson.Get(outputStr, "request.contents").Raw)
 	}
 	if got := contents[0].Get("role").String(); got != "user" {
 		t.Fatalf("Expected first content role user, got %q", got)
 	}
-	if got := contents[1].Get("role").String(); got != "user" {
-		t.Fatalf("Expected message-level system content to be downgraded to user role, got %q", got)
+	parts := contents[0].Get("parts").Array()
+	if len(parts) != 3 {
+		t.Fatalf("Expected 3 parts in merged user content, got %d: %s", len(parts), contents[0].Get("parts").Raw)
 	}
-	if got := contents[1].Get("parts.0.text").String(); got != "<system-reminder>\nString mid-conversation rule\n</system-reminder>" {
+	if got := parts[0].Get("text").String(); got != "Hello" {
+		t.Fatalf("Unexpected initial user prompt text: %q", got)
+	}
+	if got := parts[1].Get("text").String(); got != "<system-reminder>\nString mid-conversation rule\n</system-reminder>" {
 		t.Fatalf("Unexpected string message-level system content text: %q", got)
 	}
-	if got := contents[2].Get("role").String(); got != "user" {
-		t.Fatalf("Expected array message-level system content to be downgraded to user role, got %q", got)
-	}
-	if got := contents[2].Get("parts.0.text").String(); got != "<system-reminder>\nArray mid-conversation rule\n</system-reminder>" {
+	if got := parts[2].Get("text").String(); got != "<system-reminder>\nArray mid-conversation rule\n</system-reminder>" {
 		t.Fatalf("Unexpected array message-level system content text: %q", got)
 	}
 
-	parts := gjson.Get(outputStr, "request.systemInstruction.parts").Array()
-	if len(parts) != 1 {
-		t.Fatalf("Expected only top-level system parts, got %d: %s", len(parts), gjson.Get(outputStr, "request.systemInstruction.parts").Raw)
+	systemInstructionParts := gjson.Get(outputStr, "request.systemInstruction.parts").Array()
+	if len(systemInstructionParts) != 1 {
+		t.Fatalf("Expected only top-level system parts, got %d: %s", len(systemInstructionParts), gjson.Get(outputStr, "request.systemInstruction.parts").Raw)
 	}
-	if got := parts[0].Get("text").String(); got != "Top-level rules" {
+	if got := systemInstructionParts[0].Get("text").String(); got != "Top-level rules" {
 		t.Fatalf("Unexpected first system part: %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_MessageLevelDeveloperInstructionsBecomeMergedUserReminder(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3.5-flash",
+		"system": "Top-level rules",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+			{"role": "developer", "content": "String mid-conversation developer rule"},
+			{"role": "developer", "content": [{"type": "text", "text": "Array mid-conversation developer rule"}]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.5-flash", inputJSON, false)
+	outputStr := string(output)
+
+	if devContent := gjson.Get(outputStr, `request.contents.#(role=="developer")`); devContent.Exists() {
+		t.Fatalf("developer role should not be emitted in request.contents: %s", devContent.Raw)
+	}
+
+	contents := gjson.Get(outputStr, "request.contents").Array()
+	if len(contents) != 1 {
+		t.Fatalf("Expected consecutive user and developer turns to be merged into a single user turn, got %d: %s", len(contents), gjson.Get(outputStr, "request.contents").Raw)
+	}
+	if got := contents[0].Get("role").String(); got != "user" {
+		t.Fatalf("Expected first content role user, got %q", got)
+	}
+	parts := contents[0].Get("parts").Array()
+	if len(parts) != 3 {
+		t.Fatalf("Expected 3 parts in merged user content, got %d: %s", len(parts), contents[0].Get("parts").Raw)
+	}
+	if got := parts[0].Get("text").String(); got != "Hello" {
+		t.Fatalf("Unexpected initial user prompt text: %q", got)
+	}
+	if got := parts[1].Get("text").String(); got != "<system-reminder>\nString mid-conversation developer rule\n</system-reminder>" {
+		t.Fatalf("Unexpected string developer content text: %q", got)
+	}
+	if got := parts[2].Get("text").String(); got != "<system-reminder>\nArray mid-conversation developer rule\n</system-reminder>" {
+		t.Fatalf("Unexpected array developer content text: %q", got)
+	}
+
+	systemInstructionParts := gjson.Get(outputStr, "request.systemInstruction.parts").Array()
+	if len(systemInstructionParts) != 1 {
+		t.Fatalf("Expected only top-level system parts, got %d: %s", len(systemInstructionParts), gjson.Get(outputStr, "request.systemInstruction.parts").Raw)
+	}
+	if got := systemInstructionParts[0].Get("text").String(); got != "Top-level rules" {
+		t.Fatalf("Unexpected first system part: %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_PreservesToolPairingWithInterveningSystemMessage(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3.5-flash",
+		"messages": [
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Run two tools"}]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "toolu_1", "name": "tool_one", "input": {"a": 1}},
+					{"type": "tool_use", "id": "toolu_2", "name": "tool_two", "input": {"b": 2}}
+				]
+			},
+			{
+				"role": "system",
+				"content": "Context reminder between tool_use and tool_result"
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_2", "content": "result 2"},
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": "result 1"}
+				]
+			}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.5-flash", inputJSON, false)
+
+	if errPairing := internalsignature.ValidateGeminiFunctionCallPairing(output); errPairing != nil {
+		t.Fatalf("ValidateGeminiFunctionCallPairing failed: %v\noutput: %s", errPairing, output)
+	}
+
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("expected 3 merged contents (user, model, user), got %d: %s", len(contents), output)
+	}
+
+	// First turn: user
+	if contents[0].Get("role").String() != "user" {
+		t.Fatalf("expected turn 0 role user, got %s", contents[0].Get("role").String())
+	}
+	// Second turn: model (2 function calls)
+	if contents[1].Get("role").String() != "model" {
+		t.Fatalf("expected turn 1 role model, got %s", contents[1].Get("role").String())
+	}
+	// Third turn: user (1 system reminder + 2 aligned function responses)
+	if contents[2].Get("role").String() != "user" {
+		t.Fatalf("expected turn 2 role user, got %s", contents[2].Get("role").String())
+	}
+
+	// Verify response ordering matches call ordering
+	parts := contents[2].Get("parts").Array()
+	var respIDs []string
+	for _, p := range parts {
+		if id := p.Get("functionResponse.id").String(); id != "" {
+			respIDs = append(respIDs, id)
+		}
+	}
+	if len(respIDs) != 2 {
+		t.Fatalf("expected 2 responses, got %v", respIDs)
 	}
 }
 
@@ -193,7 +309,7 @@ func TestConvertClaudeRequestToAntigravity_MapsTypedWebSearchToIndependentSearch
 		"tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8, "allowed_domains": ["www.baidu.com", "weather.com.cn"]}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
 	if got := gjson.GetBytes(output, "requestType").String(); got != "web_search" {
 		t.Fatalf("requestType = %q, want web_search: %s", got, output)
 	}
@@ -229,7 +345,7 @@ func TestConvertClaudeRequestToAntigravity_UsesDefaultWebSearchMaxResultCountWit
 		"tools": [{"type": "web_search_20250305", "name": "web_search"}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.tools.0.googleSearch.enhancedContent.imageSearch.maxResultCount").Int(); got != 5 {
 		t.Fatalf("image search maxResultCount = %d, want default 5: %s", got, output)
 	}
@@ -250,7 +366,7 @@ func TestConvertClaudeRequestToAntigravity_DoesNotMapTypedWebSearchWhenMixedWith
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.1-flash-lite", inputJSON, true)
 	if got := gjson.GetBytes(output, "requestType").String(); got == "web_search" {
 		t.Fatalf("mixed tools should not become independent web_search request: %s", output)
 	}
@@ -275,7 +391,7 @@ func TestConvertClaudeRequestToAntigravity_DoesNotMapTypedWebSearchForUnsupporte
 		"tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.5-flash", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.5-flash", inputJSON, true)
 	if got := gjson.GetBytes(output, "model").String(); got != "gemini-3.5-flash" {
 		t.Fatalf("web search request model = %q, want original route model: %s", got, output)
 	}
@@ -297,7 +413,7 @@ func TestConvertClaudeRequestToAntigravity_DoesNotMapTypedWebSearchForFlashAgent
 		"tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3-flash-agent", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3-flash-agent", inputJSON, true)
 	if got := gjson.GetBytes(output, "model").String(); got != "gemini-3-flash-agent" {
 		t.Fatalf("web search request model = %q, want original route model: %s", got, output)
 	}
@@ -313,7 +429,7 @@ func TestConvertClaudeRequestToAntigravity_DoesNotMapTypedWebSearchForOtherModel
 		"tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.tools.#(googleSearch)").Raw; got != "" {
 		t.Fatalf("model without Antigravity web search capability should not get native googleSearch: %s", output)
 	}
@@ -367,7 +483,7 @@ func TestConvertClaudeRequestToAntigravity_ReattachesDetachedGeminiSignature(t *
 			{"type":"thinking","thinking":"","signature":"` + geminiSig + `"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
 		t.Fatalf("parts = %d, want one native text part; output=%s", len(parts), output)
@@ -389,7 +505,7 @@ func TestConvertClaudeRequestToAntigravity_ReattachesLeadingDetachedGeminiSignat
 			{"type":"text","text":"visible answer"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.contents.0.parts.0.thoughtSignature").String(); got != geminiSig {
 		t.Fatalf("leading detached signature = %q, want %q; output=%s", got, geminiSig, output)
 	}
@@ -399,13 +515,13 @@ func TestConvertClaudeRequestToAntigravity_DropsLegacyRawCarrierFromUserMessage(
 	geminiSig := testGeminiEPrefixSignature(t)
 	inputJSON := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"user","content":[{"type":"thinking","thinking":"","signature":"` + geminiSig + `"},{"type":"text","text":"user text"}]}]}`)
 	filtered := StripInvalidGeminiSignatureThinkingBlocks(inputJSON)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", filtered, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", filtered, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 || parts[0].Get("text").String() != "user text" || parts[0].Get("thoughtSignature").Exists() {
 		t.Fatalf("user legacy carrier reached Gemini after filtering: %s", output)
 	}
 
-	directOutput := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	directOutput, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	directParts := gjson.GetBytes(directOutput, "request.contents.0.parts").Array()
 	if len(directParts) != 1 || directParts[0].Get("text").String() != "user text" || directParts[0].Get("thoughtSignature").Exists() {
 		t.Fatalf("user legacy carrier reached Gemini without prefilter: %s", directOutput)
@@ -424,7 +540,7 @@ func TestConvertClaudeRequestToAntigravity_DistributesConsecutiveTrailingGeminiC
 			{"type":"thinking","thinking":"","signature":"` + sig2 + `"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 3 {
 		t.Fatalf("parts = %d, want two text parts + detached carrier; output=%s", len(parts), output)
@@ -451,7 +567,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesConsecutiveLeadingGeminiCarr
 			{"type":"tool_use","id":"tool-1","name":"run_command","input":{"command":"true"}}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want carrier + signed tool; output=%s", len(parts), output)
@@ -474,7 +590,7 @@ func TestConvertClaudeRequestToAntigravity_DirectToolSignatureWinsOverLeadingCar
 			{"type":"tool_use","id":"tool-1","name":"run_command","input":{"command":"true"},"signature":"` + directSig + `"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want carrier + directly signed tool; output=%s", len(parts), output)
@@ -504,7 +620,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesCarrierBetweenDirectlySigned
 			{"type":"tool_use","id":"tool-2","name":"run_command","input":{"command":"two"},"signature":"` + sig3 + `"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 3 {
 		t.Fatalf("parts = %d, want tool + carrier + tool; output=%s", len(parts), output)
@@ -533,7 +649,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesCarrierOnlyAssistantMessage(
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inputJSON := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":` + tc.content + `}]}`)
-			output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+			output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 			parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 			if len(parts) != len(tc.signatures) {
 				t.Fatalf("parts = %d, want %d carriers; output=%s", len(parts), len(tc.signatures), output)
@@ -558,7 +674,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesConsecutiveLeadingGeminiCarr
 			{"type":"text","text":"visible"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want carrier + signed text; output=%s", len(parts), output)
@@ -582,7 +698,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesTrailingCarrierAfterSignedTo
 			{"type":"thinking","thinking":"","signature":"` + sig2 + `"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want signed tool + trailing carrier; output=%s", len(parts), output)
@@ -605,7 +721,7 @@ func TestConvertClaudeRequestToAntigravity_DetachedToolCarrierTargetsFollowingTo
 			{"type":"tool_use","id":"claude-id","name":"run_command","input":{"command":"true"}}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.contents.0.parts.0.thoughtSignature").String(); got != "" {
 		t.Fatalf("detached tool signature attached backward to text: %q; output=%s", got, output)
 	}
@@ -623,7 +739,7 @@ func TestConvertClaudeRequestToAntigravity_GeminiThinkingSignatureTargetsFollowi
 			{"type":"text","text":"visible answer"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.contents.0.parts.0.thoughtSignature").String(); got != "" {
 		t.Fatalf("Gemini signature remained on thought part: %q; output=%s", got, output)
 	}
@@ -639,7 +755,7 @@ func TestConvertClaudeRequestToAntigravity_LeadingCarrierDoesNotCrossSignedThink
 	signedThought := encodeGeminiClaudeCarrierSignature(signature2, geminiClaudeCarrierStandalone, geminiClaudeCarrierText)
 	inputJSON := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"` + leading + `"},{"type":"thinking","thinking":"reason","signature":"` + signedThought + `"},{"type":"text","text":"answer"}]}]}`)
 	inputJSON = StripInvalidGeminiSignatureThinkingBlocks(inputJSON)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 3 || parts[0].Get("text").String() != "reason" || !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != signature2 || !parts[1].Get("text").Exists() || parts[1].Get("text").String() != "" || parts[1].Get("thoughtSignature").String() != signature1 || parts[2].Get("text").String() != "answer" || parts[2].Get("thoughtSignature").String() != "" {
 		t.Fatalf("leading carrier crossed signed thinking: %s", output)
@@ -653,10 +769,30 @@ func TestConvertClaudeRequestToAntigravity_DropsMismatchedMarkedNonEmptyCarrier(
 		`[{"type":"thinking","thinking":"hidden","signature":"` + encodeGeminiClaudeCarrierSignature(geminiSig, geminiClaudeCarrierStandalone, geminiClaudeCarrierFunction) + `"}]`,
 	} {
 		inputJSON := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":` + content + `}]}`)
-		output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+		output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 		if strings.Contains(string(output), geminiSig) || strings.Contains(string(output), geminiClaudeCarrierPrefix) {
 			t.Fatalf("mismatched marked carrier reached Gemini wire: %s", output)
 		}
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_GeminiThoughtTextWithFollowingPreviousCarrierRoundTrip(t *testing.T) {
+	validSignature := testGeminiEPrefixSignature(t)
+	validCarrier := encodeGeminiClaudeCarrierSignature(validSignature, geminiClaudeCarrierPrevious, geminiClaudeCarrierText)
+	inputJSON := []byte(`{"model":"gemini-3.1-pro-preview","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"let me think","signature":""},{"type":"text","text":"answer text"},{"type":"thinking","thinking":"","signature":"` + validCarrier + `"}]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
+
+	inputJSON = StripInvalidGeminiSignatureThinkingBlocks(inputJSON)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.1-pro-preview", inputJSON, false)
+
+	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("parts count = %d, want 2; output=%s", len(parts), output)
+	}
+	if !parts[0].Get("thought").Bool() || parts[0].Get("text").String() != "let me think" {
+		t.Fatalf("part[0] is not thought text; got: %s", parts[0].Raw)
+	}
+	if parts[1].Get("text").String() != "answer text" || parts[1].Get("thoughtSignature").String() != validSignature {
+		t.Fatalf("part[1] is not text with signature; got: %s", parts[1].Raw)
 	}
 }
 
@@ -669,7 +805,7 @@ func TestConvertClaudeRequestToAntigravity_GeminiThinkingSignatureTargetsFollowi
 			{"type":"tool_use","id":"claude-id","name":"run_command","input":{"command":"true"}}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 || !parts[0].Get("thought").Bool() {
 		t.Fatalf("thought/tool parts malformed: %s", output)
@@ -691,7 +827,7 @@ func TestConvertClaudeRequestToAntigravity_PreservesGeminiToolSignature(t *testi
 			{"type":"tool_use","id":"claude-id","name":"run_command","input":{"command":"true"}
 		]}]
 	}`)
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	if got := gjson.GetBytes(output, "request.contents.0.parts.0.thoughtSignature").String(); got != geminiSig {
 		t.Fatalf("tool signature = %q, want %q; output=%s", got, geminiSig, output)
 	}
@@ -708,7 +844,7 @@ func TestConvertClaudeRequestToAntigravity_NativeParallelToolLeavesUnsignedSibli
 		]}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want 2 function calls; output=%s", len(parts), output)
@@ -730,7 +866,7 @@ func TestConvertClaudeRequestToAntigravity_SyntheticParallelToolOnlyFirstGetsSen
 		]}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", inputJSON, true)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want 2 function calls; output=%s", len(parts), output)
@@ -759,7 +895,7 @@ func TestConvertClaudeRequestToAntigravity_BasicStructure(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// Check model
@@ -798,7 +934,7 @@ func TestConvertClaudeRequestToAntigravity_RoleMapping(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// assistant should be mapped to model
@@ -834,7 +970,7 @@ func TestConvertClaudeRequestToAntigravity_ThinkingBlocks(t *testing.T) {
 
 	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// Check thinking block conversion (now in contents.1 due to user message)
@@ -1210,7 +1346,7 @@ func TestConvertClaudeRequestToAntigravity_BypassModeNormalizesESignature(t *tes
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	part := gjson.Get(outputStr, "request.contents.0.parts.0")
@@ -1246,7 +1382,7 @@ func TestConvertClaudeRequestToAntigravity_BypassModePreservesShortValidSignatur
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("expected thinking part to be preserved in bypass mode, got %d parts", len(parts))
@@ -1307,7 +1443,7 @@ func TestInspectDoubleLayerSignature_TracksEncodingLayers(t *testing.T) {
 	}
 }
 
-func TestConvertClaudeRequestToAntigravity_CacheModeDropsRawSignature(t *testing.T) {
+func TestConvertClaudeRequestToAntigravity_CacheModeAcceptsNativeSignature(t *testing.T) {
 	cache.ClearSignatureCache("")
 	previous := cache.SignatureCacheEnabled()
 	cache.SetSignatureCacheEnabled(true)
@@ -1317,6 +1453,7 @@ func TestConvertClaudeRequestToAntigravity_CacheModeDropsRawSignature(t *testing
 	})
 
 	rawSignature := testAnthropicNativeSignature(t)
+	expectedAntigravitySig := base64.StdEncoding.EncodeToString([]byte(rawSignature))
 	inputJSON := []byte(`{
 		"model": "claude-sonnet-4-5-thinking",
 		"messages": [
@@ -1330,13 +1467,94 @@ func TestConvertClaudeRequestToAntigravity_CacheModeDropsRawSignature(t *testing
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("Expected native signature thinking block to be preserved in cache mode, got %d parts; output=%s", len(parts), output)
+	}
+	if !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != expectedAntigravitySig {
+		t.Fatalf("Expected normalized thinking part with signature %s, got %s", expectedAntigravitySig, parts[0].Raw)
+	}
+	if parts[1].Get("text").String() != "Answer" {
+		t.Fatalf("Expected remaining text part, got %s", parts[1].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_CacheModeDropsInvalidSignature(t *testing.T) {
+	cache.ClearSignatureCache("")
+	previous := cache.SignatureCacheEnabled()
+	cache.SetSignatureCacheEnabled(true)
+	t.Cleanup(func() {
+		cache.SetSignatureCacheEnabled(previous)
+		cache.ClearSignatureCache("")
+	})
+
+	// Seed cache with a valid signature for the same thinking text.
+	validNativeSig := testAnthropicNativeSignature(t)
+	cache.CacheSignature("claude-sonnet-4-5-thinking", "Let me think...", validNativeSig)
+
+	// Client explicitly sends an invalid signature. Cache MUST NOT be used to replace it.
+	invalidRawSignature := testNonAnthropicRawSignature(t)
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5-thinking",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "Let me think...", "signature": "` + invalidRawSignature + `"},
+					{"type": "text", "text": "Answer"}
+				]
+			}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
-		t.Fatalf("Expected raw signature thinking block to be dropped in cache mode, got %d parts", len(parts))
+		t.Fatalf("Expected invalid signature thinking block to be dropped in cache mode even if cache exists, got %d parts", len(parts))
 	}
 	if parts[0].Get("text").String() != "Answer" {
 		t.Fatalf("Expected remaining text part, got %s", parts[0].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_CacheModeRecoversSignatureWhenClientOmitsSignature(t *testing.T) {
+	cache.ClearSignatureCache("")
+	previous := cache.SignatureCacheEnabled()
+	cache.SetSignatureCacheEnabled(true)
+	t.Cleanup(func() {
+		cache.SetSignatureCacheEnabled(previous)
+		cache.ClearSignatureCache("")
+	})
+
+	validNativeSig := testAnthropicNativeSignature(t)
+	expectedAntigravitySig := base64.StdEncoding.EncodeToString([]byte(validNativeSig))
+	cache.CacheSignature("claude-sonnet-4-5-thinking", "Let me think...", validNativeSig)
+
+	// Client omitted signature (signature is empty or absent).
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5-thinking",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "Let me think...", "signature": ""},
+					{"type": "text", "text": "Answer"}
+				]
+			}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("Expected omitted signature thinking block to be recovered from cache, got %d parts; output=%s", len(parts), output)
+	}
+	if !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != expectedAntigravitySig {
+		t.Fatalf("Expected recovered thinking part with signature %s, got %s", expectedAntigravitySig, parts[0].Raw)
+	}
+	if parts[1].Get("text").String() != "Answer" {
+		t.Fatalf("Expected remaining text part, got %s", parts[1].Raw)
 	}
 }
 
@@ -1363,7 +1581,7 @@ func TestConvertClaudeRequestToAntigravity_BypassModeDropsInvalidSignature(t *te
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
@@ -1402,7 +1620,7 @@ func TestConvertClaudeRequestToAntigravity_LogsDroppedInvalidThinkingSignature(t
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 || parts[0].Get("text").String() != "Answer" {
 		t.Fatalf("expected invalid thinking block to be dropped, output: %s", output)
@@ -1453,7 +1671,7 @@ func TestConvertClaudeRequestToAntigravity_BypassModeDropsGeminiSignature(t *tes
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
 		t.Fatalf("expected Gemini-signed thinking block to be dropped, got %d parts", len(parts))
@@ -1486,7 +1704,7 @@ func TestConvertClaudeRequestToAntigravity_BypassModeDropsGeminiEPrefixSignature
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
 		t.Fatalf("expected Gemini E-prefix signed thinking block to be dropped, got %d parts: %s", len(parts), output)
@@ -1516,7 +1734,7 @@ func TestConvertClaudeRequestToAntigravity_ThinkingBlockWithoutSignature(t *test
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// Without signature, thinking block should be removed (not converted to text)
@@ -1553,7 +1771,7 @@ func TestConvertClaudeRequestToAntigravity_ToolDeclarations(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-1.5-pro", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-1.5-pro", inputJSON, false)
 	outputStr := string(output)
 
 	// Check tools structure
@@ -1593,7 +1811,7 @@ func TestConvertClaudeRequestToAntigravity_DeduplicatesAndDisambiguatesTools(t *
 		"tool_choice":{"type":"tool","name":"` + second + `"}
 	}`)
 
-	out := ConvertClaudeRequestToAntigravity("gemini-3-flash", inputJSON, false)
+	out, _ := ConvertClaudeRequestToAntigravity("gemini-3-flash", inputJSON, false)
 	declarations := gjson.GetBytes(out, "request.tools.0.functionDeclarations").Array()
 	if len(declarations) != 3 {
 		t.Fatalf("declaration count = %d, want 3. Output: %s", len(declarations), out)
@@ -1626,7 +1844,7 @@ func TestConvertClaudeRequestToAntigravity_MapsToolResultNameOnce(t *testing.T) 
 		]
 	}`)
 
-	out := ConvertClaudeRequestToAntigravity("gemini-3-flash", inputJSON, false)
+	out, _ := ConvertClaudeRequestToAntigravity("gemini-3-flash", inputJSON, false)
 	callName := gjson.GetBytes(out, "request.contents.0.parts.0.functionCall.name").String()
 	responseName := gjson.GetBytes(out, "request.contents.1.parts.0.functionResponse.name").String()
 	if callName == "" || responseName != callName {
@@ -1658,7 +1876,7 @@ func TestConvertClaudeRequestToAntigravity_ToolChoice_SpecificTool(t *testing.T)
 		"tool_choice": {"type": "tool", "name": "json"}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("gemini-3-flash-preview", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3-flash-preview", inputJSON, false)
 	outputStr := string(output)
 
 	if got := gjson.Get(outputStr, "request.toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
@@ -1688,7 +1906,7 @@ func TestConvertClaudeRequestToAntigravity_ToolUse(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// Now we expect only 1 part (tool_use), no dummy thinking block injected
@@ -1746,7 +1964,7 @@ func TestConvertClaudeRequestToAntigravity_ToolUsePreservesPresentNonObjectInput
 				}]
 			}`, inputField))
 
-			output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+			output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 			part := gjson.GetBytes(output, "request.contents.0.parts.0")
 			functionCall := part.Get("functionCall")
 			if tc.wantFunctionCall {
@@ -1786,7 +2004,7 @@ func TestConvertClaudeRequestToAntigravity_ToolUse_DropsInvalidThoughtSignatureO
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	part := gjson.GetBytes(output, "request.contents.0.parts.0")
 
 	if !part.Get("functionCall").Exists() {
@@ -1847,7 +2065,7 @@ func TestConvertClaudeRequestToAntigravity_ToolUse_DoesNotReuseThinkingSignature
 
 	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	part := gjson.Get(outputStr, "request.contents.1.parts.1")
@@ -1885,7 +2103,7 @@ func TestConvertClaudeRequestToAntigravity_ReorderThinking(t *testing.T) {
 
 	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// Verify order: Thinking block MUST be first (now in contents.1 due to user message)
@@ -1936,7 +2154,7 @@ func TestConvertClaudeRequestToAntigravity_ReorderTextAfterFunctionCall(t *testi
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
@@ -1985,7 +2203,7 @@ func TestConvertClaudeRequestToAntigravity_ReorderParallelFunctionCalls(t *testi
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
@@ -2004,6 +2222,59 @@ func TestConvertClaudeRequestToAntigravity_ReorderParallelFunctionCalls(t *testi
 	}
 	if parts[3].Get("functionCall.name").String() != "Read" || parts[3].Get("functionCall.id").String() != "call_2" {
 		t.Errorf("Expected fc2 fourth, got %s", parts[3].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_AlignsPermutedParallelToolResultsWithMixedText(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gemini-3.7-flash-high",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"call_1620603","name":"Read","input":{"file_path":"/tmp/1"}},
+				{"type":"tool_use","id":"call_1620604","name":"Read","input":{"file_path":"/tmp/2"}},
+				{"type":"tool_use","id":"call_1620605","name":"Read","input":{"file_path":"/tmp/3"}},
+				{"type":"tool_use","id":"call_1620606","name":"Read","input":{"file_path":"/tmp/4"}},
+				{"type":"tool_use","id":"call_1620607","name":"Read","input":{"file_path":"/tmp/5"}},
+				{"type":"tool_use","id":"call_1620608","name":"Read","input":{"file_path":"/tmp/6"}}
+			]},
+			{"role":"user","content":[
+				{"type":"text","text":"Tool results follow."},
+				{"type":"tool_result","tool_use_id":"call_1620608","content":"six"},
+				{"type":"tool_result","tool_use_id":"call_1620605","content":"three"},
+				{"type":"tool_result","tool_use_id":"call_1620603","content":"one"},
+				{"type":"text","text":"Continue after reading."},
+				{"type":"tool_result","tool_use_id":"call_1620607","content":"five"},
+				{"type":"tool_result","tool_use_id":"call_1620604","content":"two"},
+				{"type":"tool_result","tool_use_id":"call_1620606","content":"four"}
+			]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("gemini-3.7-flash-high", inputJSON, false)
+	parts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(parts) != 8 {
+		t.Fatalf("parts = %d, want eight parts; output=%s", len(parts), output)
+	}
+	if got := parts[0].Get("text").String(); got != "Tool results follow." {
+		t.Fatalf("leading text = %q; output=%s", got, output)
+	}
+	for index := 0; index < 3; index++ {
+		wantID := fmt.Sprintf("call_162060%d", index+3)
+		if gotID := parts[index+1].Get("functionResponse.id").String(); gotID != wantID {
+			t.Fatalf("functionResponse[%d].id = %q, want %q; output=%s", index+1, gotID, wantID, output)
+		}
+	}
+	if got := parts[4].Get("text").String(); got != "Continue after reading." {
+		t.Fatalf("middle text = %q; output=%s", got, output)
+	}
+	for index := 3; index < 6; index++ {
+		wantID := fmt.Sprintf("call_162060%d", index+3)
+		if gotID := parts[index+2].Get("functionResponse.id").String(); gotID != wantID {
+			t.Fatalf("functionResponse[%d].id = %q, want %q; output=%s", index+2, gotID, wantID, output)
+		}
+	}
+	if errPairing := internalsignature.ValidateGeminiFunctionCallPairing(output); errPairing != nil {
+		t.Fatalf("translated parallel tool history is invalid: %v; output=%s", errPairing, output)
 	}
 }
 
@@ -2039,7 +2310,7 @@ func TestConvertClaudeRequestToAntigravity_ReorderThinkingAndTextBeforeFunctionC
 
 	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// contents.1 = assistant message (contents.0 = user)
@@ -2091,7 +2362,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResult(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// Check function response conversion
@@ -2104,6 +2375,144 @@ func TestConvertClaudeRequestToAntigravity_ToolResult(t *testing.T) {
 	}
 	if funcResp.Get("name").String() != "get_weather" {
 		t.Errorf("Expected function name 'get_weather', got '%s'", funcResp.Get("name").String())
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_NonThinkingClaudePreservesToolResultAdjacency(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"file":"README.md"}}]},
+			{"role":"user","content":[
+				{"type":"text","text":"Continue after the tool result."},
+				{"type":"tool_result","tool_use_id":"call_1","content":"file contents"}
+			]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("expected model turn, function response turn, and text turn; got %d: %s", len(contents), output)
+	}
+	if !gjson.GetBytes([]byte(contents[1].Raw), "parts.0.functionResponse").Exists() {
+		t.Fatalf("expected function response immediately after model turn: %s", output)
+	}
+	if got := gjson.GetBytes([]byte(contents[2].Raw), "parts.0.text").String(); got != "Continue after the tool result." {
+		t.Fatalf("text turn = %q, want reminder text", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_InterveningSystemReminderPreservesToolResultAdjacency(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-opus-4-6-thinking",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"file":"README.md"}}]},
+			{"role":"system","content":"System reminder instruction."},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"file contents"}]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, false)
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("expected model turn, function response turn, and reminder turn; got %d: %s", len(contents), output)
+	}
+	if !gjson.GetBytes([]byte(contents[1].Raw), "parts.0.functionResponse").Exists() {
+		t.Fatalf("expected function response immediately after model turn: %s", output)
+	}
+	if got := gjson.GetBytes([]byte(contents[2].Raw), "parts.0.text").String(); got != "<system-reminder>\nSystem reminder instruction.\n</system-reminder>" {
+		t.Fatalf("text turn = %q, want reminder text", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_InterveningDeveloperReminderPreservesToolResultAdjacency(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"file":"README.md"}}]},
+			{"role":"developer","content":"Developer reminder instruction."},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"file contents"}]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("expected model turn, function response turn, and reminder turn; got %d: %s", len(contents), output)
+	}
+	if !gjson.GetBytes([]byte(contents[1].Raw), "parts.0.functionResponse").Exists() {
+		t.Fatalf("expected function response immediately after model turn: %s", output)
+	}
+	if got := gjson.GetBytes([]byte(contents[2].Raw), "parts.0.text").String(); got != "<system-reminder>\nDeveloper reminder instruction.\n</system-reminder>" {
+		t.Fatalf("text turn = %q, want reminder text", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ParallelToolResultsAcrossMessagesPreservesToolResultAdjacency(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"call_1","name":"Read","input":{"file":"README.md"}},
+				{"type":"tool_use","id":"call_2","name":"Write","input":{"file":"app.go"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"readme contents"}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"write ok"}]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 2 {
+		t.Fatalf("expected model turn and merged function response turn; got %d: %s", len(contents), output)
+	}
+	parts := gjson.GetBytes([]byte(contents[1].Raw), "parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 function response parts in single user turn, got %d: %s", len(parts), contents[1].Raw)
+	}
+	if !parts[0].Get("functionResponse").Exists() || !parts[1].Get("functionResponse").Exists() {
+		t.Fatalf("expected both parts to be functionResponse: %s", contents[1].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ClaudeThinkingPreservesToolResultAdjacency(t *testing.T) {
+	cache.ClearSignatureCache("")
+	nativeSignature, antigravitySignature := testAntigravityClaudeSignature(t)
+	thinkingText := "Let me check the file."
+	cache.CacheSignature("claude-opus-4-6-thinking", thinkingText, nativeSignature)
+
+	inputJSON := []byte(`{
+		"model":"claude-opus-4-6-thinking",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"` + thinkingText + `","signature":"` + nativeSignature + `"},
+				{"type":"tool_use","id":"call_1","name":"Read","input":{"file":"README.md"}}
+			]},
+			{"role":"user","content":[
+				{"type":"text","text":"Check details."},
+				{"type":"tool_result","tool_use_id":"call_1","content":"file contents"}
+			]}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, false)
+	contents := gjson.GetBytes(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("expected model turn, function response turn, and text turn; got %d: %s", len(contents), output)
+	}
+	modelParts := gjson.GetBytes([]byte(contents[0].Raw), "parts").Array()
+	if len(modelParts) < 2 || !modelParts[0].Get("thought").Bool() {
+		t.Fatalf("expected thinking block in model turn: %s", contents[0].Raw)
+	}
+	if modelParts[0].Get("thoughtSignature").String() != antigravitySignature {
+		t.Fatalf("expected thoughtSignature %q, got %q", antigravitySignature, modelParts[0].Get("thoughtSignature").String())
+	}
+	if !gjson.GetBytes([]byte(contents[1].Raw), "parts.0.functionResponse").Exists() {
+		t.Fatalf("expected function response immediately after model turn: %s", output)
+	}
+	if got := gjson.GetBytes([]byte(contents[2].Raw), "parts.0.text").String(); got != "Check details." {
+		t.Fatalf("text turn = %q, want text", got)
 	}
 }
 
@@ -2146,7 +2555,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultName_TouluFormat(t *testing
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-haiku-4-5-20251001", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-haiku-4-5-20251001", inputJSON, false)
 	outputStr := string(output)
 
 	funcResp0 := gjson.Get(outputStr, "request.contents.1.parts.0.functionResponse")
@@ -2194,7 +2603,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultName_CustomFormat(t *testin
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-haiku-4-5-20251001", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-haiku-4-5-20251001", inputJSON, false)
 	outputStr := string(output)
 
 	funcResp := gjson.Get(outputStr, "request.contents.1.parts.0.functionResponse")
@@ -2223,7 +2632,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultName_NoMatchingToolUse_Heur
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	funcResp := gjson.Get(outputStr, "request.contents.0.parts.0.functionResponse")
@@ -2252,7 +2661,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultName_NoMatchingToolUse_RawI
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	funcResp := gjson.Get(outputStr, "request.contents.0.parts.0.functionResponse")
@@ -2281,7 +2690,7 @@ func TestConvertClaudeRequestToAntigravity_ThinkingConfig(t *testing.T) {
 		}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// Check thinking config conversion (only if model supports thinking in registry)
@@ -2318,7 +2727,7 @@ func TestConvertClaudeRequestToAntigravity_ImageContent(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// Check inline data conversion
@@ -2344,7 +2753,7 @@ func TestConvertClaudeRequestToAntigravity_GenerationConfig(t *testing.T) {
 		"max_tokens": 2000
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	genConfig := gjson.Get(outputStr, "request.generationConfig")
@@ -2385,7 +2794,7 @@ func TestConvertClaudeRequestToAntigravity_TrailingUnsignedThinking_Removed(t *t
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// The last part of the last assistant message should NOT be a thinking block
@@ -2431,7 +2840,7 @@ func TestConvertClaudeRequestToAntigravity_TrailingSignedThinking_Kept(t *testin
 
 	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// The signed thinking block should be preserved
@@ -2461,7 +2870,7 @@ func TestConvertClaudeRequestToAntigravity_MiddleUnsignedThinking_Removed(t *tes
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// Unsigned thinking should be removed entirely
@@ -2499,7 +2908,7 @@ func TestConvertClaudeRequestToAntigravity_ToolAndThinking_HintInjected(t *testi
 		"thinking": {"type": "enabled", "budget_tokens": 8000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// System instruction should contain the interleaved thinking hint
@@ -2537,7 +2946,7 @@ func TestConvertClaudeRequestToAntigravity_ToolsOnly_NoHint(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	// System instruction should NOT contain the hint
@@ -2560,7 +2969,7 @@ func TestConvertClaudeRequestToAntigravity_ThinkingOnly_NoHint(t *testing.T) {
 		"thinking": {"type": "enabled", "budget_tokens": 8000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// System instruction should NOT contain the hint (no tools)
@@ -2602,7 +3011,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultNoContent(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, true)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2645,7 +3054,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultNullContent(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, true)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6-thinking", inputJSON, true)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2686,7 +3095,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultWithImage(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2750,7 +3159,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultWithSingleImage(t *testing.
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2813,7 +3222,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultWithMultipleImagesAndTexts(
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2887,7 +3296,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultWithOnlyMultipleImages(t *t
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -2947,7 +3356,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultImageNotBase64(t *testing.T
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -3000,7 +3409,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultImageMissingData(t *testing
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -3050,7 +3459,7 @@ func TestConvertClaudeRequestToAntigravity_ToolResultImageMissingMediaType(t *te
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 	outputStr := string(output)
 
 	if !gjson.Valid(outputStr) {
@@ -3109,7 +3518,7 @@ func TestConvertClaudeRequestToAntigravity_BypassMode_DropsRedactedThinkingBlock
 		"thinking": {"type": "enabled", "budget_tokens": 10000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
 
 	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
 	if len(assistantParts) != 1 {
@@ -3157,7 +3566,7 @@ func TestConvertClaudeRequestToAntigravity_BypassMode_DropsWrappedRedactedThinki
 		"thinking": {"type": "enabled", "budget_tokens": 8000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
 
 	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
 	if len(assistantParts) != 1 {
@@ -3193,7 +3602,7 @@ func TestConvertClaudeRequestToAntigravity_BypassMode_DropsWrappedRedactedThinki
 		}]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
 	toolPart := gjson.GetBytes(output, "request.contents.0.parts.0")
 	if !toolPart.Get("functionCall").Exists() {
 		t.Fatalf("Expected tool part preserved: %s", output)
@@ -3232,7 +3641,7 @@ func TestConvertClaudeRequestToAntigravity_BypassMode_KeepsNonEmptyThinking(t *t
 		"thinking": {"type": "enabled", "budget_tokens": 10000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
 
 	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
 	if len(assistantParts) != 2 {
@@ -3290,7 +3699,7 @@ func TestConvertClaudeRequestToAntigravity_BypassMode_MultiTurnRedactedThinking(
 		"thinking": {"type": "enabled", "budget_tokens": 10000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
 
 	if !gjson.ValidBytes(output) {
 		t.Fatalf("Output is not valid JSON: %s", string(output))
@@ -3344,7 +3753,7 @@ func TestConvertClaudeRequestToAntigravity_ToolAndThinking_NoExistingSystem(t *t
 		"thinking": {"type": "enabled", "budget_tokens": 8000}
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
 	// System instruction should be created with hint
@@ -3404,7 +3813,7 @@ func TestConvertClaudeRequestToAntigravityStripsPropertyNames(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
 
 	decls := gjson.GetBytes(output, "request.tools.0.functionDeclarations")
 	if !decls.IsArray() || len(decls.Array()) != 2 {
@@ -3419,5 +3828,99 @@ func TestConvertClaudeRequestToAntigravityStripsPropertyNames(t *testing.T) {
 	}
 	if !decls.Get("1.parametersJsonSchema.properties.properties").Exists() {
 		t.Errorf("property named properties was lost: %s", decls.Get("1").Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravityToolChoiceNoneOmitsTools(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		toolChoice string
+	}{
+		{name: "string none", toolChoice: `"none"`},
+		{name: "object none", toolChoice: `{"type":"none"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inputJSON := []byte(`{
+				"model":"claude-sonnet-4-5",
+				"messages":[{"role":"user","content":"hi"}],
+				"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object"}}],
+				"tool_choice":` + tc.toolChoice + `
+			}`)
+			out, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+			if got := gjson.GetBytes(out, "request.toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
+				t.Fatalf("expected mode NONE, got %q", got)
+			}
+			if gjson.GetBytes(out, "request.tools").Exists() {
+				t.Fatalf("expected request.tools to be omitted, got %s", gjson.GetBytes(out, "request.tools").Raw)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToAntigravityToolChoiceNoneOmitsInterleavedThinkingHint(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		toolChoice string
+	}{
+		{name: "string none", toolChoice: `"none"`},
+		{name: "object none", toolChoice: `{"type":"none"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inputJSON := []byte(`{
+				"model":"claude-sonnet-4-5-thinking",
+				"messages":[{"role":"user","content":"Answer without calling tools."}],
+				"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object"}}],
+				"tool_choice":` + tc.toolChoice + `,
+				"thinking":{"type":"enabled","budget_tokens":1024}
+			}`)
+			out, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
+			if got := gjson.GetBytes(out, "request.toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
+				t.Fatalf("expected mode NONE, got %q", got)
+			}
+			if gjson.GetBytes(out, "request.tools").Exists() {
+				t.Fatalf("expected request.tools to be omitted, got %s", gjson.GetBytes(out, "request.tools").Raw)
+			}
+			sysInstr := gjson.GetBytes(out, "request.systemInstruction").Raw
+			if strings.Contains(sysInstr, "Interleaved thinking is enabled") {
+				t.Fatalf("expected interleaved thinking hint to be omitted when tool_choice is none, got systemInstruction: %s", sysInstr)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_FunctionResponseJSONRef(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "toolu_schema_1", "name": "get_schema", "input": {}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_schema_1",
+						"content": {
+							"schema": {
+								"$ref": "#/components/schemas/ErrorModel"
+							}
+						}
+					}
+				]
+			}
+		]
+	}`)
+
+	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	result := gjson.GetBytes(output, "request.contents.1.parts.0.functionResponse.response.result")
+	if result.Type != gjson.String {
+		t.Fatalf("expected functionResponse.response.result to be string, got %s (raw: %s)", result.Type, result.Raw)
+	}
+	if !strings.Contains(result.String(), "#/components/schemas/ErrorModel") {
+		t.Fatalf("expected result to contain ref target, got %q", result.String())
 	}
 }

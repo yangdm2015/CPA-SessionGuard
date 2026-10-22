@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -35,7 +35,7 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in Gemini API format
-func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	functionNameMap := util.SanitizedFunctionNameMap(inputRawJSON)
 	// Keep the envelope in []byte form. Round-tripping through string copies the
@@ -49,7 +49,7 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 	fixedJSON, errFixCLIToolResponse := fixCLIToolResponse(rawJSON)
 	if errFixCLIToolResponse != nil {
-		return []byte{}
+		return []byte{}, nil
 	}
 	rawJSON = fixedJSON
 
@@ -57,6 +57,8 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.systemInstruction", []byte(systemInstructionResult.Raw))
 		rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.system_instruction")
 	}
+
+	rawJSON = normalizeGeminiGenerationConfigResponseSchema(rawJSON)
 
 	// Normalize roles in request.contents: default to valid values if missing/invalid.
 	// The contents array is only materialized when a role actually changes; copying
@@ -69,7 +71,9 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			role := value.Get("role").String()
 			content := []byte(value.Raw)
 			if role != "user" && role != "model" {
-				if previousRole == "" || previousRole == "model" {
+				if translatorcommon.ContentHasGeminiFunctionResponse([]byte(value.Raw)) {
+					role = "user"
+				} else if previousRole == "" || previousRole == "model" {
 					role = "user"
 				} else {
 					role = "model"
@@ -151,7 +155,28 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		rawJSON = signature.SanitizeGeminiRequestThoughtSignatures(rawJSON, "request.contents")
 	}
 
-	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")
+	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings"), nil
+}
+
+// normalizeGeminiGenerationConfigResponseSchema converts generationConfig.responseJsonSchema
+// (and snake_case response_json_schema) to generationConfig.responseSchema for Antigravity compatibility.
+func normalizeGeminiGenerationConfigResponseSchema(rawJSON []byte) []byte {
+	for _, container := range []string{"request.generationConfig", "request.generation_config"} {
+		if !util.GetGJSONBytesNoCopy(rawJSON, container).Exists() {
+			continue
+		}
+		for _, schemaKey := range []string{"responseJsonSchema", "response_json_schema"} {
+			oldPath := container + "." + schemaKey
+			if schema := util.GetGJSONBytesNoCopy(rawJSON, oldPath); schema.Exists() {
+				targetPath := container + ".responseSchema"
+				if !util.GetGJSONBytesNoCopy(rawJSON, targetPath).Exists() {
+					rawJSON, _ = sjson.SetRawBytes(rawJSON, targetPath, []byte(schema.Raw))
+				}
+				rawJSON, _ = sjson.DeleteBytes(rawJSON, oldPath)
+			}
+		}
+	}
+	return rawJSON
 }
 
 // geminiContentRolesNeedNormalization reports whether any content role is missing
@@ -639,6 +664,74 @@ type FunctionCallGroup struct {
 	CallNames       []string // ordered function call names for backfilling empty response names
 }
 
+func normalizeAntigravityInlineDataPart(part gjson.Result) ([]byte, bool) {
+	inline := part.Get("inlineData")
+	if !inline.Exists() {
+		inline = part.Get("inline_data")
+	}
+	if !inline.Exists() {
+		return nil, false
+	}
+	data := inline.Get("data").String()
+	if data == "" {
+		return nil, false
+	}
+	mimeType := inline.Get("mimeType").String()
+	if mimeType == "" {
+		mimeType = inline.Get("mime_type").String()
+	}
+	if mimeType == "" {
+		// Cloud Code Assist ignores inlineData without mimeType.
+		mimeType = "image/png"
+	}
+	out := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+	out, _ = sjson.SetBytes(out, "inlineData.mimeType", mimeType)
+	out, _ = sjson.SetBytes(out, "inlineData.data", data)
+	return out, true
+}
+
+func attachInlineDataToFunctionResponse(response gjson.Result, images [][]byte) gjson.Result {
+	if len(images) == 0 {
+		return response
+	}
+	target := []byte(response.Raw)
+	for _, img := range images {
+		target, _ = sjson.SetRawBytes(target, "functionResponse.parts.-1", img)
+	}
+	return gjson.ParseBytes(target)
+}
+
+// collectFunctionResponsesWithSiblingInlineData keeps functionResponse parts and
+// moves sibling inline_data/inlineData onto the nearest preceding functionResponse.
+// Leading images before the first functionResponse attach to that first response.
+func collectFunctionResponsesWithSiblingInlineData(parts gjson.Result) []gjson.Result {
+	responses := make([]gjson.Result, 0)
+	leadingImages := make([][]byte, 0)
+	current := -1
+	parts.ForEach(func(_, part gjson.Result) bool {
+		if part.Get("functionResponse").Exists() {
+			responses = append(responses, part)
+			current = len(responses) - 1
+			if len(leadingImages) > 0 {
+				responses[current] = attachInlineDataToFunctionResponse(responses[current], leadingImages)
+				leadingImages = nil
+			}
+			return true
+		}
+		imagePart, ok := normalizeAntigravityInlineDataPart(part)
+		if !ok {
+			return true
+		}
+		if current >= 0 {
+			responses[current] = attachInlineDataToFunctionResponse(responses[current], [][]byte{imagePart})
+			return true
+		}
+		leadingImages = append(leadingImages, imagePart)
+		return true
+	})
+	return responses
+}
+
 // parseFunctionResponseRaw attempts to normalize a function response part into a JSON object string.
 // Falls back to a minimal "functionResponse" object when parsing fails.
 // fallbackName is used when the response's own name is empty.
@@ -749,14 +842,8 @@ func fixCLIToolResponse(input []byte) ([]byte, error) {
 		role := value.Get("role").String()
 		parts := value.Get("parts")
 
-		// Check if this content has function responses
-		var responsePartsInThisContent []gjson.Result
-		parts.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("functionResponse").Exists() {
-				responsePartsInThisContent = append(responsePartsInThisContent, part)
-			}
-			return true
-		})
+		// Collect function responses and attach sibling inlineData to the nearest one.
+		responsePartsInThisContent := collectFunctionResponsesWithSiblingInlineData(parts)
 
 		// If this content has function responses, collect them
 		if len(responsePartsInThisContent) > 0 {

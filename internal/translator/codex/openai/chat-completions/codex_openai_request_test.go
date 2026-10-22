@@ -1,6 +1,8 @@
 package chat_completions
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -47,7 +49,7 @@ func TestToolCallSimple(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -136,7 +138,7 @@ func TestToolCallWithContent(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -213,7 +215,7 @@ func TestToolCallOutputWithMultimodalContent(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	output := gjson.Get(result, "input.2.output")
@@ -304,7 +306,7 @@ func TestToolCallOutputWithStringifiedImageContent(t *testing.T) {
 				]
 			}`)
 
-			out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+			out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 			output := gjson.GetBytes(out, "input.2.output")
 			if !output.IsArray() {
 				t.Fatalf("expected stringified image output to be an array, got: %s", output.Raw)
@@ -362,7 +364,7 @@ func TestToolCallOutputKeepsNonImageStrings(t *testing.T) {
 				]
 			}`)
 
-			out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+			out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 			output := gjson.GetBytes(out, "input.2.output")
 			if output.Type != gjson.String {
 				t.Fatalf("expected output to remain a string, got: %s", output.Raw)
@@ -401,7 +403,7 @@ func TestToolCallOutputFallsBackForInvalidStructuredParts(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	parts := gjson.Get(result, "input.2.output").Array()
@@ -458,7 +460,7 @@ func TestToolCallOutputWithNonStringJSONContent(t *testing.T) {
 				]
 			}`)
 
-			out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+			out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 			result := string(out)
 
 			output := gjson.Get(result, "input.2.output")
@@ -486,7 +488,7 @@ func TestConvertOpenAIRequestToCodexPreservesInputAudio(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.5", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.5", input, true)
 	parts := gjson.GetBytes(out, "input.0.content").Array()
 	if len(parts) != 2 {
 		t.Fatalf("expected 2 content parts, got %d: %s", len(parts), gjson.GetBytes(out, "input.0.content").Raw)
@@ -558,7 +560,7 @@ func TestMultipleToolCalls(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -629,7 +631,7 @@ func TestNoSpuriousEmptyAssistantMessage(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -693,7 +695,7 @@ func TestMultiTurnToolCalling(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -777,7 +779,7 @@ func TestToolNameShortening(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -830,7 +832,7 @@ func TestCustomToolNameShortening(t *testing.T) {
 		"tool_choice":{"type":"custom","name":"` + longName + `"}
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("expected user, custom call, and custom output, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -876,7 +878,7 @@ func TestCustomToolShortNameCollisionPreservesFunctionFamily(t *testing.T) {
 		"tool_choice":{"type":"function","function":{"name":"` + functionName + `"}}
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 2 {
 		t.Fatalf("expected function call and output, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -910,7 +912,7 @@ func TestSameNameCustomAndFunctionDefaultsToFunctionFamily(t *testing.T) {
 		"tool_choice":{"type":"function","function":{"name":"shared_tool"}}
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 2 {
 		t.Fatalf("expected function call and output, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -960,7 +962,7 @@ func TestEmptyStringContent(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -1002,7 +1004,7 @@ func TestCallIDsMatchBetweenCallAndOutput(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	items := gjson.Get(result, "input").Array()
@@ -1079,7 +1081,7 @@ func TestCustomToolCallHistory(t *testing.T) {
 		"tool_choice": {"type":"function","function":{"name":"apply_patch"}}
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 5 {
 		t.Fatalf("expected 5 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1140,7 +1142,7 @@ func TestCustomToolCallResponseFollowUpRoundTrip(t *testing.T) {
 	if got := assistantMessage.Get("tool_calls.0.type").String(); got != "function" {
 		t.Fatalf("expected response to normalize custom call as function, got %s", assistantMessage.Raw)
 	}
-	if got := assistantMessage.Get("tool_calls.0.function.arguments").String(); got != "patch" {
+	if got := assistantMessage.Get("tool_calls.0.function.arguments").String(); got != `{"input":"patch"}` {
 		t.Fatalf("expected normalized custom input, got %s", assistantMessage.Raw)
 	}
 
@@ -1152,7 +1154,7 @@ func TestCustomToolCallResponseFollowUpRoundTrip(t *testing.T) {
 		],
 		"tools":[{"type":"custom","name":"apply_patch","description":"Apply a patch."}]
 	}`)
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", followUpRequest, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", followUpRequest, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("expected user, custom call, and custom output, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1162,6 +1164,9 @@ func TestCustomToolCallResponseFollowUpRoundTrip(t *testing.T) {
 	}
 	if got := items[2].Get("type").String(); got != "custom_tool_call_output" {
 		t.Fatalf("expected custom_tool_call_output after response round trip, got %s", items[2].Raw)
+	}
+	if got := items[1].Get("input").String(); got != "patch" {
+		t.Fatalf("raw follow-up input = %q", got)
 	}
 }
 
@@ -1182,7 +1187,7 @@ func TestMixedToolCallHistoryPreservesCallFamilies(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 5 {
 		t.Fatalf("expected 5 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1217,7 +1222,7 @@ func TestToolCallHistoryAllowsReusedCallIDAcrossRounds(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 5 {
 		t.Fatalf("expected 5 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1241,7 +1246,7 @@ func TestCustomToolCallHistorySynthesizesMissingCallID(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 2 {
 		t.Fatalf("expected orphan output to be dropped and missing ID pair preserved, got %d items: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1274,7 +1279,7 @@ func TestToolCallHistoryClearsUnmatchedCallAtNewBatch(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("expected two calls and one output, got %d items: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1296,7 +1301,7 @@ func TestToolCallOutputWithoutIDUsesPendingCall(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 4 {
 		t.Fatalf("expected two calls and two outputs, got %d items: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1328,7 +1333,7 @@ func TestAmbiguousDuplicateToolCallIDsAreDropped(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 1 || items[0].Get("role").String() != "user" {
 		t.Fatalf("expected ambiguous calls and outputs to be dropped, got %s", gjson.GetBytes(out, "input").Raw)
@@ -1350,7 +1355,7 @@ func TestOrphanAndDuplicateToolCallOutputsAreDropped(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
 	items := gjson.GetBytes(out, "input").Array()
 	if len(items) != 2 {
 		t.Fatalf("expected only the matched call and first output, got %d items: %s", len(items), gjson.GetBytes(out, "input").Raw)
@@ -1385,7 +1390,7 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
 	tools := gjson.Get(result, "tools").Array()
@@ -1402,5 +1407,472 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
+	}
+}
+
+func TestFunctionToolStrictDefaultsToFalse(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.6-sol",
+		"messages": [
+			{"role": "user", "content": "Hi"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "omitted",
+					"parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+				}
+			},
+			{
+				"type": "function",
+				"function": {
+					"name": "explicit_true",
+					"strict": true,
+					"parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}
+				}
+			},
+			{
+				"type": "function",
+				"function": {
+					"name": "explicit_false",
+					"strict": false,
+					"parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+				}
+			}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	tools := gjson.GetBytes(out, "tools").Array()
+	if len(tools) != 3 {
+		t.Fatalf("expected 3 tools, got %d: %s", len(tools), gjson.GetBytes(out, "tools").Raw)
+	}
+
+	expected := map[string]bool{"omitted": false, "explicit_true": true, "explicit_false": false}
+	for _, tool := range tools {
+		name := tool.Get("name").String()
+		strict := tool.Get("strict")
+		if !strict.Exists() {
+			t.Errorf("tool %q: strict missing in output: %s", name, tool.Raw)
+			continue
+		}
+		if strict.Bool() != expected[name] {
+			t.Errorf("tool %q: strict = %v, want %v", name, strict.Bool(), expected[name])
+		}
+	}
+}
+
+func TestNormalizeInvalidToolNames(t *testing.T) {
+	nameWithInvalidChars := "mcp.server:search tool"
+	input := []byte(`{
+		"model": "gpt-5.6-sol",
+		"messages": [
+			{"role": "user", "content": "Search for info"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_1",
+						"type": "function",
+						"function": {
+							"name": "` + nameWithInvalidChars + `",
+							"arguments": "{\"query\":\"test\"}"
+						}
+					}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_1", "content": "result"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "` + nameWithInvalidChars + `",
+					"description": "Search tool",
+					"parameters": {"type": "object", "properties": {}}
+				}
+			}
+		],
+		"tool_choice": {
+			"type": "function",
+			"function": {"name": "` + nameWithInvalidChars + `"}
+		}
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	toolNameInTools := gjson.GetBytes(out, "tools.0.name").String()
+	nameRegex := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	if !nameRegex.MatchString(toolNameInTools) {
+		t.Fatalf("expected tool name in tools to match ^[a-zA-Z0-9_-]+$, got %q", toolNameInTools)
+	}
+
+	var funcCallName string
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() == "function_call" {
+			funcCallName = item.Get("name").String()
+			break
+		}
+	}
+	if funcCallName != toolNameInTools {
+		t.Fatalf("expected function_call name %q to match tools declaration %q", funcCallName, toolNameInTools)
+	}
+
+	toolChoiceName := gjson.GetBytes(out, "tool_choice.name").String()
+	if toolChoiceName != toolNameInTools {
+		t.Fatalf("expected tool_choice name %q to match tools declaration %q", toolChoiceName, toolNameInTools)
+	}
+
+	rev := buildReverseMapFromOriginalOpenAI(input)
+	if got := rev[toolNameInTools]; got != nameWithInvalidChars {
+		t.Fatalf("expected reverse map for %q to be %q, got %q", toolNameInTools, nameWithInvalidChars, got)
+	}
+}
+
+func TestNormalizeInvalidToolNamesCollisionAndNonASCII(t *testing.T) {
+	name1 := "tool.search"
+	name2 := "tool:search"
+	nameUnicode := "工具_run"
+	input := []byte(`{
+		"model": "gpt-5.6-sol",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [
+			{
+				"type": "function",
+				"function": {"name": "` + name1 + `"}
+			},
+			{
+				"type": "function",
+				"function": {"name": "` + name2 + `"}
+			},
+			{
+				"type": "function",
+				"function": {"name": "` + nameUnicode + `"}
+			}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	tools := gjson.GetBytes(out, "tools").Array()
+	if len(tools) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(tools))
+	}
+	nameRegex := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	seen := map[string]bool{}
+	for i, tool := range tools {
+		name := tool.Get("name").String()
+		if !nameRegex.MatchString(name) {
+			t.Fatalf("tool %d name %q does not match ^[a-zA-Z0-9_-]+$", i, name)
+		}
+		if seen[name] {
+			t.Fatalf("collision detected for tool %d: %q", i, name)
+		}
+		seen[name] = true
+	}
+}
+
+func TestHistoricalToolCallCollisionWithDeclaredTool(t *testing.T) {
+	declaredName := "tool:search"
+	historicalName := "tool.search"
+	input := []byte(`{
+		"model": "gpt-5.6-sol",
+		"messages": [
+			{"role": "user", "content": "previous call"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_hist_1",
+						"type": "function",
+						"function": {
+							"name": "` + historicalName + `",
+							"arguments": "{}"
+						}
+					}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_hist_1", "content": "hist result"},
+			{"role": "user", "content": "new query"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "` + declaredName + `",
+					"description": "current search tool"
+				}
+			}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	toolDeclared := gjson.GetBytes(out, "tools.0.name").String()
+
+	var histCallName string
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() == "function_call" {
+			histCallName = item.Get("name").String()
+			break
+		}
+	}
+
+	if toolDeclared == "" || histCallName == "" {
+		t.Fatalf("expected both names non-empty, got declared=%q hist=%q", toolDeclared, histCallName)
+	}
+	if toolDeclared == histCallName {
+		t.Fatalf("expected historical tool name and declared tool name not to collide, both got %q", toolDeclared)
+	}
+
+	// Verify reverse mapping in response restores both
+	rev := buildReverseMapFromOriginalOpenAI(input)
+	if got := rev[toolDeclared]; got != declaredName {
+		t.Fatalf("expected reverse map for declared %q to be %q, got %q", toolDeclared, declaredName, got)
+	}
+	if got := rev[histCallName]; got != historicalName {
+		t.Fatalf("expected reverse map for historical %q to be %q, got %q", histCallName, historicalName, got)
+	}
+}
+
+func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantTier   string
+		wantExists bool
+		wantEffort string
+	}{
+		{
+			name:       "priority service tier preserved",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","service_tier":"priority"}`,
+			wantTier:   "priority",
+			wantExists: true,
+			wantEffort: "high",
+		},
+		{
+			name:       "priority case-insensitive and trimmed",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","service_tier":"  PRIORITY  "}`,
+			wantTier:   "priority",
+			wantExists: true,
+			wantEffort: "low",
+		},
+		{
+			name:       "fast service tier normalized to priority",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":"fast"}`,
+			wantTier:   "priority",
+			wantExists: true,
+			wantEffort: "medium",
+		},
+		{
+			name:       "fast case-insensitive and trimmed",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":"  Fast  "}`,
+			wantTier:   "priority",
+			wantExists: true,
+			wantEffort: "medium",
+		},
+		{
+			name:       "ultrafast service tier preserved",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":"ultrafast"}`,
+			wantTier:   "ultrafast",
+			wantExists: true,
+			wantEffort: "medium",
+		},
+		{
+			name:       "default service tier omitted",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":"default"}`,
+			wantExists: false,
+			wantEffort: "medium",
+		},
+		{
+			name:       "auto service tier omitted",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":"auto"}`,
+			wantExists: false,
+			wantEffort: "medium",
+		},
+		{
+			name:       "non-string service tier omitted",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}],"service_tier":1}`,
+			wantExists: false,
+			wantEffort: "medium",
+		},
+		{
+			name:       "absent service tier omitted",
+			body:       `{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}]}`,
+			wantExists: false,
+			wantEffort: "medium",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _ := ConvertOpenAIRequestToCodex("gpt-6-sol", []byte(tt.body), true)
+			tierRes := gjson.GetBytes(out, "service_tier")
+			if tierRes.Exists() != tt.wantExists {
+				t.Fatalf("service_tier exists = %v, want %v; payload=%s", tierRes.Exists(), tt.wantExists, out)
+			}
+			if tt.wantExists && tierRes.String() != tt.wantTier {
+				t.Fatalf("service_tier = %q, want %q; payload=%s", tierRes.String(), tt.wantTier, out)
+			}
+			if gotEffort := gjson.GetBytes(out, "reasoning.effort").String(); gotEffort != tt.wantEffort {
+				t.Fatalf("reasoning.effort = %q, want %q; payload=%s", gotEffort, tt.wantEffort, out)
+			}
+		})
+	}
+}
+
+func TestApplyPatchChatHistoryBoundary(t *testing.T) {
+	for _, tc := range []struct{ name, tools, call, wantType, want string }{
+		{"normalized", `[{"type":"custom","name":"apply_patch"}]`, `{"type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"p\"}"}}`, "custom_tool_call", "p"},
+		{"legacy", `[{"type":"custom","name":"apply_patch"}]`, `{"type":"function","function":{"name":"apply_patch","arguments":"raw patch"}}`, "custom_tool_call", "raw patch"},
+		{"explicit", `[{"type":"custom","name":"apply_patch"}]`, `{"type":"custom","custom":{"name":"apply_patch","input":"{\"input\":\"p\"}"}}`, "custom_tool_call", `{"input":"p"}`},
+		{"invalid-wrapper", `[{"type":"custom","name":"apply_patch"}]`, `{"type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"p\",\"extra\":1}"}}`, "custom_tool_call", `{"input":"p","extra":1}`},
+		{"function-preference", `[{"type":"custom","name":"apply_patch"},{"type":"function","function":{"name":"apply_patch","parameters":{}}}]`, `{"type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"p\"}"}}`, "function_call", `{"input":"p"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"tools":` + tc.tools + `,"messages":[{"role":"assistant","tool_calls":[` + tc.call + `]}]}`)
+			out, _ := ConvertOpenAIRequestToCodex("m", raw, true)
+			items := gjson.GetBytes(out, "input").Array()
+			item := items[len(items)-1]
+			field := "arguments"
+			if tc.wantType == "custom_tool_call" {
+				field = "input"
+			}
+			if item.Get("type").String() != tc.wantType || item.Get(field).String() != tc.want {
+				t.Fatalf("history boundary: %s", out)
+			}
+		})
+	}
+}
+
+// Codex rejects call_id values longer than 64 characters, so over-length client
+// IDs must be shortened consistently for calls and their outputs.
+func TestOverLengthToolCallIDsAreShortenedConsistently(t *testing.T) {
+	sharedPrefix := strings.Repeat("a", 70)
+	longA := sharedPrefix + "_A"
+	longB := sharedPrefix + "_B"
+	input := []byte(`{
+		"model": "gpt-6.1-sol",
+		"messages": [
+			{"role": "user", "content": "Multi-tool"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{"id": "` + longA + `", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+					{"id": "` + longB + `", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+					{"id": "short_id", "type": "function", "function": {"name": "tool_c", "arguments": "{}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "` + longA + `", "content": "res_a"},
+			{"role": "tool", "tool_call_id": "` + longB + `", "content": "res_b"},
+			{"role": "tool", "tool_call_id": "short_id", "content": "res_c"}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-6.1-sol", input, true)
+
+	var callIDs, outputIDs []string
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		switch item.Get("type").String() {
+		case "function_call":
+			callIDs = append(callIDs, item.Get("call_id").String())
+		case "function_call_output":
+			outputIDs = append(outputIDs, item.Get("call_id").String())
+		}
+	}
+	if len(callIDs) != 3 || len(outputIDs) != 3 {
+		t.Fatalf("expected 3 calls and 3 outputs, got %d and %d: %s", len(callIDs), len(outputIDs), out)
+	}
+	for i := range callIDs {
+		if len(callIDs[i]) > 64 {
+			t.Fatalf("call_id %d length = %d, want <= 64: %q", i, len(callIDs[i]), callIDs[i])
+		}
+		if callIDs[i] != outputIDs[i] {
+			t.Fatalf("output %d call_id = %q, want %q", i, outputIDs[i], callIDs[i])
+		}
+	}
+	if callIDs[0] == callIDs[1] {
+		t.Fatalf("distinct over-length IDs collapsed to %q", callIDs[0])
+	}
+	if callIDs[2] != "short_id" {
+		t.Fatalf("short call_id = %q, want unchanged", callIDs[2])
+	}
+}
+
+// A legal 64-character client ID may equal the shortened form of another
+// over-length ID; results must still reach their own calls.
+func TestShortenedToolCallIDCollisionWithLegalIDKeepsResultsMatched(t *testing.T) {
+	longA := strings.Repeat("a", 70) + "_A"
+	idB := shortenCodexCallIDIfNeeded(longA)
+	if len(idB) != 64 || idB == longA {
+		t.Fatalf("test setup: shortened ID = %q", idB)
+	}
+	input := []byte(`{
+		"model": "gpt-6.1-sol",
+		"messages": [
+			{"role": "user", "content": "Multi-tool"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{"id": "` + longA + `", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+					{"id": "` + idB + `", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "` + idB + `", "content": "res_b"},
+			{"role": "tool", "tool_call_id": "` + longA + `", "content": "res_a"}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIRequestToCodex("gpt-6.1-sol", input, true)
+
+	callIDByName := map[string]string{}
+	outputIDByResult := map[string]string{}
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		switch item.Get("type").String() {
+		case "function_call":
+			callIDByName[item.Get("name").String()] = item.Get("call_id").String()
+		case "function_call_output":
+			outputIDByResult[item.Get("output").String()] = item.Get("call_id").String()
+		}
+	}
+	if len(callIDByName) != 2 || len(outputIDByResult) != 2 {
+		t.Fatalf("expected 2 calls and 2 outputs: %s", out)
+	}
+	if callIDByName["tool_a"] == callIDByName["tool_b"] {
+		t.Fatalf("calls share call_id %q", callIDByName["tool_a"])
+	}
+	if callIDByName["tool_b"] != idB {
+		t.Fatalf("legal call_id = %q, want unchanged %q", callIDByName["tool_b"], idB)
+	}
+	if outputIDByResult["res_a"] != callIDByName["tool_a"] || outputIDByResult["res_b"] != callIDByName["tool_b"] {
+		t.Fatalf("results mismatched: calls=%v outputs=%v", callIDByName, outputIDByResult)
+	}
+}
+
+func TestConvertOpenAIRequestToCodexParallelToolCalls(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    string
+		wantType gjson.Type
+	}{
+		{name: "false preserved", field: `"parallel_tool_calls":false,`, wantType: gjson.False},
+		{name: "true preserved", field: `"parallel_tool_calls":true,`, wantType: gjson.True},
+		{name: "null defaults to true", field: `"parallel_tool_calls":null,`, wantType: gjson.True},
+		{name: "omitted defaults to true", field: "", wantType: gjson.True},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := []byte(`{"model":"gpt-6.1-sol",` + tt.field + `"messages":[{"role":"user","content":"hello"}]}`)
+			output, errConvert := ConvertOpenAIRequestToCodex("gpt-6.1-sol", inputJSON, true)
+			if errConvert != nil {
+				t.Fatalf("ConvertOpenAIRequestToCodex returned error: %v", errConvert)
+			}
+			if got := gjson.GetBytes(output, "parallel_tool_calls"); got.Type != tt.wantType {
+				t.Fatalf("parallel_tool_calls = %s (type %v), want type %v; output: %s", got.Raw, got.Type, tt.wantType, string(output))
+			}
+		})
 	}
 }

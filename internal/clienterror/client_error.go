@@ -50,6 +50,10 @@ func HTTPStatusFromError(err error) int {
 			return code
 		}
 	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if errors.Is(err, context.Canceled) {
 		return StatusClientClosedRequest
 	}
@@ -92,6 +96,16 @@ func IsRequestFault(status int, err error) bool {
 	if status == http.StatusUnauthorized && hasAuthenticationErrorBody(err) {
 		return false
 	}
+	// Claude's missing thread state is tied to the stale continuation ID rather
+	// than the selected credential. Let the client replay the full conversation.
+	if IsClaudeThreadNotFound(status, err) {
+		return true
+	}
+	// Model not found indicates a credential-model capability mismatch rather than
+	// a caller request error. Preserve rotation and cooldown for the model.
+	if hasModelNotFoundErrorBody(err) {
+		return false
+	}
 	if hasRequestFaultBody(err) {
 		return true
 	}
@@ -122,6 +136,50 @@ func IsItemNotPersisted(message string) bool {
 	return strings.Contains(lower, "item with id") &&
 		strings.Contains(lower, "not found") &&
 		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+// IsClaudeThreadNotFound reports the Claude 404 response for a stale
+// previous_message_id continuation from either a structured JSON response
+// or a plain-text error message.
+func IsClaudeThreadNotFound(status int, err error) bool {
+	if status != http.StatusNotFound || err == nil {
+		return false
+	}
+	body := strings.TrimSpace(err.Error())
+	type responseBodyProvider interface {
+		ResponseBody() []byte
+	}
+	var responseBody responseBodyProvider
+	if errors.As(err, &responseBody) && responseBody != nil && len(responseBody.ResponseBody()) > 0 {
+		body = strings.TrimSpace(string(responseBody.ResponseBody()))
+	}
+	if body == "" {
+		return false
+	}
+	if json.Valid([]byte(body)) {
+		return strings.EqualFold(strings.TrimSpace(gjson.Get(body, "error.type").String()), "not_found_error") &&
+			strings.Contains(strings.ToLower(gjson.Get(body, "error.message").String()), "thread state") &&
+			strings.Contains(strings.ToLower(gjson.Get(body, "error.message").String()), "previous_message_id")
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "thread state") && strings.Contains(lower, "previous_message_id")
+}
+
+func hasModelNotFoundErrorBody(err error) bool {
+	if err == nil {
+		return false
+	}
+	body := strings.TrimSpace(err.Error())
+	if body == "" || !json.Valid([]byte(body)) {
+		return false
+	}
+	for _, path := range []string{"error.code", "code", "response.error.code", "body.error.code"} {
+		code := strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))
+		if code == "model_not_found" || code == "model_not_found_error" {
+			return true
+		}
+	}
+	return false
 }
 
 func hasAuthenticationErrorBody(err error) bool {
@@ -157,6 +215,31 @@ func hasRequestFaultBody(err error) bool {
 	for _, path := range []string{"error.type", "type", "response.error.type", "body.error.type"} {
 		errType := strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))
 		if _, ok := requestFaultTypes[errType]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// IsClientCancellation reports whether an HTTP status code or error represents
+// a client-initiated cancellation (HTTP 499 StatusClientClosedRequest or context.Canceled).
+func IsClientCancellation(status int, err error) bool {
+	if status == StatusClientClosedRequest {
+		return true
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return true
+		}
+		type statusCoder interface {
+			StatusCode() int
+		}
+		var sc statusCoder
+		if errors.As(err, &sc) && sc != nil && sc.StatusCode() == StatusClientClosedRequest {
+			return true
+		}
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "context canceled") || strings.Contains(lower, "client closed request") {
 			return true
 		}
 	}

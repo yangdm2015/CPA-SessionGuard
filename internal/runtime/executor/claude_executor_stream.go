@@ -9,18 +9,22 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if opts.Alt == "responses/compact" {
-		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if errExpand := expandClaudeResponsesCompaction(&req, &opts); errExpand != nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+	}
+	if claudeResponsesCompactionRequested(req, opts) {
+		return e.executeClaudeCompactionStream(ctx, auth, req, opts)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	upstreamModel := e.upstreamModel(baseModel)
@@ -30,17 +34,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		baseURL = "https://api.anthropic.com"
 	}
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	oauthToken := isClaudeOAuthToken(apiKey)
+	fp := resolveClaudeFingerprintPolicy(e.cfg, auth, apiKey)
 	defer func() {
-		if cancelErr := newClaudeOAuthCancellationError(ctx, oauthToken, err); cancelErr != nil {
+		if cancelErr := newClaudeOAuthCancellationError(ctx, fp.OAuthCancellation, err); cancelErr != nil {
 			err = cancelErr
 		}
 	}()
-	cchSigning := claudeCCHSigningEnabled(apiKey, claudeCCHUpstreamAnthropic, url)
+	// Same split as Execute: OAuth signs everywhere, an opted-in API key only on
+	// upstreams the native gate accepts.
+	cchSigning := claudeCCHSigningEnabled(apiKey, claudeCCHUpstreamAnthropic, fp.ProfileClaudeCodeCLI, url)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	if upstreamModel != baseModel {
+		reporter.SetUpstreamModel(upstreamModel)
+	}
 	from := opts.SourceFormat
+	ctx, req, opts = e.applyNativeToolSearchFallback(ctx, auth, from, upstreamModel, req, opts)
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
 	var replayScope claudeThinkingReplayScope
@@ -58,28 +68,47 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	originalPayload := originalPayloadSource
 	incomingHeaders, claudeCodeDetection := detectIncomingClaudeCodeRequest(ctx, opts.Headers, originalPayload, false, e.cfg)
-	confirmedClaudeCode := claudeCodeDetection.Confirmed
+	wirePolicy, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, claudeCodeDetection.Confirmed)
+	confirmedClaudeCode := isEffectiveConfirmedClaudeCode(claudeCodeDetection, wirePolicy)
 	claudeSessionID := ""
-	if oauthToken {
+	if fp.ProfileClaudeCodeCLI {
 		claudeSessionID = helps.ClaudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.Payload, confirmedClaudeCode, opts.Metadata, req.Metadata)
 	}
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true, helps.APIKeyModelIsCompat(req))
-	body := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true, helps.APIKeyModelIsCompat(req))
+
+	continuityCtx := &helps.ClaudeContinuityContext{}
+	ctx = helps.WithClaudeContinuityContext(ctx, continuityCtx)
+	ctx = helps.WithIncomingHeaders(ctx, incomingHeaders)
+	ctx = helps.WithClaudeExecutionMetadata(ctx, helps.ClaudeRequestHasExecutionMetadata(opts.Metadata, req.Metadata))
+	if claudeSessionID != "" {
+		ctx = helps.WithClaudeSessionID(ctx, claudeSessionID)
+	}
+
+	isCompat := helps.APIKeyModelIsCompat(req)
+	originalTranslated, body, err := helps.TranslateRequestPairReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true, isCompat)
+	if err != nil {
+		return nil, err
+	}
 	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
+	webSearchSessionKey, webSearchTTL, webSearchLimit := e.claudeWebSearchResultCacheScope(ctx, auth, from, req, opts, originalPayload)
+	body = helps.RestoreClaudeWebSearchResultsContext(ctx, body, webSearchSessionKey, webSearchTTL)
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	bodyBeforeCloaking := body
+	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
+	explicitCacheMode := isExplicitPromptCacheMode(originalPayload, req.Payload, body)
+	if explicitCacheMode {
+		ctx = withExplicitPromptCacheMode(ctx, true)
+	}
 	var cloaked bool
-	body, cloaked, err = applyCloaking(
+	body, cloaked, err = applyCloakingInternal(
 		ctx,
 		e.cfg,
 		auth,
@@ -87,29 +116,40 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		apiKey,
 		confirmedClaudeCode,
 		cchSigning,
+		false,
+		explicitCacheMode,
 	)
 	if err != nil {
 		return nil, err
 	}
-	systemPlacementState := captureClaudeCodeSystemPlacement(bodyBeforeCloaking, body, cloaked)
 	// Only the Messages endpoint on Anthropic itself was captured; count_tokens
 	// keeps its own shape and other gateways never see this field.
 	diagnosticsState := claudeDiagnosticsRequestState{}
+	if !isProbeOrHelper {
+		isProbeOrHelper = helps.IsClaudeProbeOrHelperRequest(body)
+	}
+	if continuityCtx.Initialized {
+		diagnosticsState = claudeDiagnosticsRequestState{
+			key:      continuityCtx.Key,
+			sequence: continuityCtx.Sequence,
+			promptID: continuityCtx.PromptID,
+		}
+	}
 	contextManagementState := claudeCodeContextManagementState{
 		eligible:    cloaked && isAnthropicUpstreamBase(baseURL),
 		callerOwned: gjson.GetBytes(body, "context_management").Exists(),
 	}
 	if contextManagementState.eligible {
 		body, contextManagementState.automaticallyInjected = injectClaudeCodeContextManagement(body)
-		if oauthToken {
-			body, diagnosticsState = injectClaudeDiagnostics(body, auth, claudeSessionID)
+		if fp.InjectDiagnostics && !isProbeOrHelper {
+			if continuityCtx.Initialized {
+				body, diagnosticsState = injectClaudeDiagnosticsWithState(body, continuityCtx.Key, continuityCtx.Sequence, continuityCtx.PreviousMessageID, continuityCtx.PromptID)
+			} else {
+				body, diagnosticsState = injectClaudeDiagnostics(body, auth, claudeSessionID)
+			}
 		}
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body, contextManagementState.payloadRuleTouched = helps.ApplyPayloadConfigWithRequestTracked(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers, "context_management")
-	body = reconcileClaudeCodeSystemPlacementAfterPayload(body, systemPlacementState)
 	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
@@ -123,13 +163,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// first-user marker cannot suppress system/latest-user breakpoints.
 	// cloaked and confirmedClaudeCode are mutually exclusive: resolveClaudeWirePolicy
 	// forces Cloak off for a confirmed native client.
-	cpaOwnsCacheControl := shouldEnsureCacheControl(body, cloaked, confirmedClaudeCode)
+	cpaOwnsCacheControl := shouldEnsureCacheControl(body, cloaked, confirmedClaudeCode, originalPayload, req.Payload)
 	if cpaOwnsCacheControl {
 		body = ensureCacheControl(body)
 	}
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
+	// Cloaking and ensureCacheControl may push the total over 4 when the client
+	// already sends multiple cache_control blocks.
 	body = enforceCacheControlLimit(body, 4)
+	body = stripPromptCacheOptions(body)
 
 	// Native selects the 1h cache pool only for OAuth credentials and pairs it with
 	// extended-cache-ttl-2025-04-11, which claudeCodeCLIBetas emits on exactly the
@@ -141,43 +184,76 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// opt-in to 5m, so a cloaked caller's bare {"type":"ephemeral"} is upgraded too.
 	// Only a ttl the caller wrote out explicitly survives, because
 	// upgradeClaudeCacheControlTTL skips any block that already has one.
-	if cpaOwnsCacheControl && claudeCredentialUsesOAuth(auth, apiKey) {
+	// claude-code-cli fingerprint profiles emit extended-cache-ttl and must use the same 1h pool.
+	// In native Claude Code, subagents default to 5m unless 1h is explicitly configured;
+	// probes omit both 1h cache and extended-cache-ttl.
+	isSubagent := helps.IsClaudeSubagentRequest(incomingHeaders, body)
+	subagent1h := isSubagent && helps.ClaudeSubagentRequests1h(incomingHeaders, body)
+	if cpaOwnsCacheControl && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
 		body = upgradeClaudeCacheControlTTL(body, claudeCacheControlTTL1h)
+	} else if (isProbeOrHelper || (isSubagent && !subagent1h)) && !explicitCacheMode {
+		body = stripClaudeCacheControlTTL(body)
 	}
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	body = normalizeCacheControlTTL(body)
+	if !explicitCacheMode {
+		body = normalizeCacheControlTTL(body)
+	}
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
 	bodyForUpstream := body
 	var oauthToolNamesReverseMap map[string]string
-	if oauthToken && cloaked {
+	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
-		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, mcpAliases)
+		bodyForUpstream, oauthToolNamesReverseMap, err = e.prepareClaudeOAuthToolNamesForRequest(bodyForUpstream, mcpAliases)
+		if err != nil {
+			return nil, err
+		}
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel, helps.APIKeyModelIsCompat(req))
-	if oauthToken {
-		bodyForUpstream, _, err = helps.ApplyClaudeCredentialMetadata(bodyForUpstream, auth, claudeSessionID)
+	if fp.ApplyCLIIdentity {
+		bodyForUpstream, err = applyClaudeCLIIdentity(bodyForUpstream, auth, apiKey, url, claudeSessionID, fp.SynthesizeIdentity)
 		if err != nil {
-			return nil, fmt.Errorf("apply Claude credential metadata: %w", err)
+			return nil, err
 		}
+	}
+	if cloaked && len(wireSettings.sensitiveWords) > 0 {
+		matcher := helps.BuildSensitiveWordMatcher(wireSettings.sensitiveWords)
+		bodyForUpstream = helps.ObfuscateSensitiveWords(bodyForUpstream, matcher)
 	}
 	cchBilling := ""
 	if cchSigning {
 		if !claudeCodeDetection.HelperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream) {
 			cchBilling = claudeCCHFallbackBillingHeader(ctx, e.cfg, bodyForUpstream, claudeCodeDetection.Entrypoint)
 		}
-		bodyForUpstream, err = finalizeAnthropicMessagesBodyCCH(bodyForUpstream, cchBilling)
+		bodyForUpstream, err = ensureClaudeBillingHeaderCCHPlaceholder(bodyForUpstream, cchBilling)
 		if err != nil {
 			return nil, fmt.Errorf("finalize Claude CCH: %w", err)
 		}
 	}
-	// Runs on the finished body: payload rules can rewrite model and messages
-	// long after translation, so an earlier check would not describe the request
-	// that is about to be sent.
+	bodyForUpstream = stripDefaultKimiClaudeCodeAttribution(auth, url, fp.ProfileClaudeCodeCLI, bodyForUpstream)
+	bodyForUpstream = applyClaudePreservedThinkingBinding(bodyForUpstream)
+	// User rules match the fully prepared business body and are applied only once.
+	var touchedPayloadPaths map[string]bool
+	bodyForUpstream, touchedPayloadPaths = helps.ApplyPayloadConfigWithTrackedPaths(
+		e.cfg, baseModel, to.String(), from.String(), "", bodyForUpstream, stripTranslatedDefaultMaxTokens(from, originalPayload, originalTranslated),
+		helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers,
+		"diagnostics",
+	)
+	if touchedPayloadPaths["diagnostics"] {
+		diagnosticsState = claudeDiagnosticsRequestState{}
+	}
+	extraBetas, bodyForUpstream = extractAndRemoveBetas(bodyForUpstream)
+	bodyForUpstream = stripPromptCacheOptions(bodyForUpstream)
+	if cchSigning {
+		bodyForUpstream, err = signAnthropicMessagesBody(bodyForUpstream)
+		if err != nil {
+			return nil, fmt.Errorf("sign Claude CCH: %w", err)
+		}
+	}
+	// Read-only validation must observe the final configured model and messages.
 	if errMidSystem := validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL)); errMidSystem != nil {
 		return nil, errMidSystem
 	}
@@ -232,7 +308,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			helps.LogWithRequestID(ctx).Warn(msg)
-			errClassified := classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, []byte(msg))
+			errClassified := classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, []byte(msg), e.modelLevelCooling())
 			if fastRequest {
 				return nil, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errClassified)
 			}
@@ -253,7 +329,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if fastRequest {
 			return nil, newClaudeFastDirectResponseError(httpResp, b)
 		}
-		return nil, classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, b)
+		return nil, classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, b, e.modelLevelCooling())
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, claudeResponseContentEncoding(httpResp.Header))
 	if err != nil {
@@ -271,13 +347,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				log.Errorf("response body close error: %v", errClose)
 			}
 		}()
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		emitCancellation := func(cause error) bool {
-			cancelErr := newClaudeOAuthCancellationError(ctx, oauthToken, cause)
+			cancelErr := newClaudeOAuthCancellationError(ctx, fp.OAuthCancellation, cause)
 			if cancelErr == nil {
 				return false
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, cancelErr)
-			reporter.PublishFailure(ctx, cancelErr)
+			streamUsage.PublishFailure(ctx, reporter, cancelErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: cancelErr}:
 			default:
@@ -287,7 +365,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		emitResponseError := func(errResponse error) {
 			errResponse = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errResponse)
 			helps.RecordAPIResponseError(ctx, e.cfg, errResponse)
-			reporter.PublishFailure(ctx, errResponse)
+			streamUsage.PublishFailure(ctx, reporter, errResponse)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errResponse}:
 			case <-ctx.Done():
@@ -300,11 +378,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
 			var upstreamMessageID string
+			var upstreamStreamErr error
 			upstreamCompleted := false
 			flushEvent := func() bool {
 				if event.Len() == 0 {
 					return true
 				}
+				observeClaudeSSEEvent(event.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
 				cloned := bytes.Clone(event.Bytes())
 				event.Reset()
 				select {
@@ -316,11 +396,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
-				observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
+				reporter.ObserveResponseModel(line)
+				streamUsage.ObserveClaudeStream(line)
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 				if errRestore != nil {
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
@@ -329,30 +407,45 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				line = e.restoreResponseModel(restoredLine, req.Model)
 				event.Write(line)
 				event.WriteByte('\n')
-				if len(bytes.TrimSpace(line)) == 0 && !flushEvent() {
-					emitCancellation(ctx.Err())
-					return
+				if len(bytes.TrimSpace(line)) == 0 {
+					if !flushEvent() {
+						emitCancellation(ctx.Err())
+						return
+					}
+					if upstreamCompleted || upstreamStreamErr != nil {
+						break
+					}
 				}
 			}
 			if !flushEvent() {
 				emitCancellation(ctx.Err())
 				return
 			}
-			if emitCancellation(scanner.Err()) {
-				return
-			}
-			if errScan := scanner.Err(); errScan != nil {
-				errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
-				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.PublishFailure(ctx, errScan)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-				case <-ctx.Done():
+			if !upstreamCompleted {
+				if emitCancellation(scanner.Err()) {
+					return
 				}
-				return
+				errScan := scanner.Err()
+				if errScan == nil {
+					errScan = upstreamStreamErr
+				}
+				if errScan == nil && ctx.Err() == nil {
+					errScan = statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before message_stop"}
+				}
+				if errScan != nil {
+					errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
+					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					streamUsage.PublishFailure(ctx, reporter, errScan)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+					case <-ctx.Done():
+					}
+					return
+				}
 			}
 			if upstreamCompleted {
-				commitClaudeDiagnostics(diagnosticsState, upstreamMessageID)
+				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+				e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 			}
 			return
 		}
@@ -361,36 +454,45 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), bodyForTranslation, &param)
 		var upstreamMessageID string
+		var upstreamStreamErr error
+		var eventBuf bytes.Buffer
 		upstreamCompleted := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			eventBuf.Write(line)
+			eventBuf.WriteByte('\n')
+			if len(bytes.TrimSpace(line)) == 0 {
+				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				eventBuf.Reset()
 			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			reporter.ObserveResponseModel(line)
+			streamUsage.ObserveClaudeStream(line)
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 			if errRestore != nil {
 				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
 				return
 			}
 			line = e.restoreResponseModel(restoredLine, req.Model)
+			helps.RecordClaudeWebSearchResultsContext(ctx, webSearchSessionKey, line, webSearchTTL, webSearchLimit)
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
 				responseFormat,
 				req.Model,
-				opts.OriginalRequest,
+				helps.ApplyPatchOriginalRequest(req, opts),
 				bodyForTranslation,
 				bytes.Clone(line),
 				&param,
 			)
-			if responseFormat == sdktranslator.FormatOpenAIResponse {
+			if responseFormat == sdktranslator.FormatOpenAIResponse && helps.ApplyPatchTranslationError(param) == nil {
 				for i, chunk := range chunks {
 					chunks[i] = helps.EnsureResponsesUsageDetails(chunk)
 				}
 			}
+			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -399,22 +501,45 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return
 				}
 			}
-		}
-		if emitCancellation(scanner.Err()) {
-			return
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
+			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+				return
 			}
+			if upstreamCompleted || upstreamStreamErr != nil {
+				break
+			}
+		}
+		if eventBuf.Len() > 0 {
+			observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+			eventBuf.Reset()
+		}
+		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 			return
+		}
+		if !upstreamCompleted {
+			if emitCancellation(scanner.Err()) {
+				return
+			}
+			errScan := scanner.Err()
+			if errScan == nil {
+				errScan = upstreamStreamErr
+			}
+			if errScan == nil && ctx.Err() == nil {
+				errScan = statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before message_stop"}
+			}
+			if errScan != nil {
+				errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
+				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+				streamUsage.PublishFailure(ctx, reporter, errScan)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+				case <-ctx.Done():
+				}
+				return
+			}
 		}
 		if upstreamCompleted {
-			commitClaudeDiagnostics(diagnosticsState, upstreamMessageID)
+			commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+			e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 		}
 	}()
 	result := &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}

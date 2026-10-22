@@ -18,7 +18,7 @@ func TestConvertGeminiRequestToGeminiReusesLargeNormalizedPayload(t *testing.T) 
 	// a failing benchmark aborts before any iteration completes and yields a zero
 	// BenchmarkResult, so AllocedBytesPerOp would report 0 and silently satisfy the
 	// allocation check below exactly when the payload is being copied.
-	output := ConvertGeminiRequestToGemini("gemini-test", input, false)
+	output, _ := ConvertGeminiRequestToGemini("gemini-test", input, false)
 	if &output[0] != &input[0] {
 		t.Fatal("normalized request should reuse the input payload")
 	}
@@ -27,7 +27,7 @@ func TestConvertGeminiRequestToGeminiReusesLargeNormalizedPayload(t *testing.T) 
 	result := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			largeInlineDataBenchmarkOutput = ConvertGeminiRequestToGemini("gemini-test", input, false)
+			largeInlineDataBenchmarkOutput, _ = ConvertGeminiRequestToGemini("gemini-test", input, false)
 		}
 	})
 
@@ -53,7 +53,7 @@ func BenchmarkConvertGeminiRequestToGeminiLargeInlineData(b *testing.B) {
 			b.SetBytes(int64(len(input)))
 			b.ResetTimer()
 			for b.Loop() {
-				largeInlineDataBenchmarkOutput = ConvertGeminiRequestToGemini("gemini-test", input, false)
+				largeInlineDataBenchmarkOutput, _ = ConvertGeminiRequestToGemini("gemini-test", input, false)
 			}
 		})
 	}
@@ -170,7 +170,7 @@ func TestConvertGeminiRequestToGemini_BackfillsEmptyName(t *testing.T) {
 		]
 	}`)
 
-	out := ConvertGeminiRequestToGemini("", input, false)
+	out, _ := ConvertGeminiRequestToGemini("", input, false)
 
 	name := gjson.GetBytes(out, "contents.1.parts.0.functionResponse.name").String()
 	if name != "Bash" {
@@ -251,5 +251,22 @@ func TestBackfillEmptyFunctionResponseNames_MultipleGroups(t *testing.T) {
 	}
 	if name1 != "Grep" {
 		t.Errorf("Expected second group name 'Grep', got '%s'", name1)
+	}
+}
+
+func TestConvertGeminiRequestToGemini_FunctionResponseWithInvalidRoleNormalizesToUser(t *testing.T) {
+	inputJSON := []byte(`{
+		"contents": [
+			{"role": "user", "parts": [{"text": "reminder"}]},
+			{"role": "invalid", "parts": [{"functionResponse": {"name": "lookup", "response": {}}}]}
+		]
+	}`)
+	out, _ := ConvertGeminiRequestToGemini("gemini-3-flash", inputJSON, false)
+	contents := gjson.GetBytes(out, "contents").Array()
+	if len(contents) != 2 {
+		t.Fatalf("expected 2 contents, got %d", len(contents))
+	}
+	if got := contents[1].Get("role").String(); got != "user" {
+		t.Fatalf("functionResponse invalid role should normalize to user, got %q", got)
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -78,7 +78,7 @@ func compatibleGeminiResponsesCarrierSignature(rawSignature, targetKind string) 
 
 func geminiResponsesCarrierSemanticTarget(item gjson.Result) string {
 	switch item.Get("type").String() {
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		return geminiResponsesCarrierFunction
 	case "reasoning":
 		if strings.TrimSpace(item.Get("summary.0.text").String()) != "" {

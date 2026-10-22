@@ -17,6 +17,15 @@ type statusError struct {
 func (e statusError) Error() string   { return e.body }
 func (e statusError) StatusCode() int { return e.status }
 
+type responseBodyError struct {
+	status int
+	body   string
+}
+
+func (e responseBodyError) Error() string        { return "upstream request failed" }
+func (e responseBodyError) StatusCode() int      { return e.status }
+func (e responseBodyError) ResponseBody() []byte { return []byte(e.body) }
+
 func TestHTTPStatusFromError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -183,6 +192,26 @@ func TestIsRequestFault(t *testing.T) {
 			want:   true,
 		},
 		{
+			name:   "Claude missing thread state",
+			status: http.StatusNotFound,
+			err:    errors.New(`{"type":"error","error":{"type":"not_found_error","message":"No thread state was found for the requested previous_message_id. Replay the full conversation with thread create to start a new Thread."}}`),
+			want:   true,
+		},
+		{
+			name:   "Claude missing thread state plain text",
+			status: http.StatusNotFound,
+			err:    errors.New("No thread state was found for the requested previous_message_id. Replay the full conversation with thread create to start a new Thread."),
+			want:   true,
+		},
+		{
+			name: "Claude missing thread state in response body",
+			err: responseBodyError{
+				status: http.StatusNotFound,
+				body:   `{"type":"error","error":{"type":"not_found_error","message":"No thread state was found for the requested previous_message_id."}}`,
+			},
+			want: true,
+		},
+		{
 			// An upstream internal error is not a request fault: it must stay eligible
 			// for credential rotation and (credential, model) cooldown.
 			name:   "upstream unknown internal error",
@@ -190,6 +219,8 @@ func TestIsRequestFault(t *testing.T) {
 			err:    errors.New(`{"error":{"code":500,"message":"Internal error encountered.","status":"UNKNOWN"}}`),
 		},
 		{name: "plain not found", status: http.StatusNotFound, err: errors.New("model not found")},
+		{name: "generic Claude not found", status: http.StatusNotFound, err: errors.New(`{"error":{"type":"not_found_error","message":"Not Found"}}`)},
+		{name: "Claude missing thread on server error", status: http.StatusInternalServerError, err: errors.New(`{"error":{"type":"not_found_error","message":"No thread state was found for the requested previous_message_id."}}`)},
 		{name: "unauthorized", status: http.StatusUnauthorized, err: errors.New("invalid token")},
 		{
 			name:   "deepseek authentication failure is credential failure",
@@ -201,6 +232,12 @@ func TestIsRequestFault(t *testing.T) {
 			name:   "deepseek insufficient balance is payment failure",
 			status: http.StatusPaymentRequired,
 			err:    errors.New(`{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}`),
+			want:   false,
+		},
+		{
+			name:   "structured model_not_found is not request fault",
+			status: http.StatusBadRequest,
+			err:    errors.New(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"The model gpt-5.5 does not exist or you do not have access to it."}}`),
 			want:   false,
 		},
 		{
@@ -219,6 +256,36 @@ func TestIsRequestFault(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsRequestFault(tc.status, tc.err); got != tc.want {
 				t.Fatalf("IsRequestFault(%d, %v) = %t, want %t", tc.status, tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsClientCancellation(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		err    error
+		want   bool
+	}{
+		{name: "status 499", status: StatusClientClosedRequest, want: true},
+		{name: "context canceled error", status: 0, err: context.Canceled, want: true},
+		{name: "fmt wrapped context canceled", status: 0, err: fmt.Errorf("read: %w", context.Canceled), want: true},
+		{name: "context canceled string in error", status: 0, err: errors.New("upstream failed: context canceled"), want: true},
+		{name: "client closed request string in error", status: 0, err: errors.New("client closed request"), want: true},
+		{name: "statusCoder with 499", status: 0, err: statusError{status: StatusClientClosedRequest, body: "aborted"}, want: true},
+		{name: "status 200 without error", status: http.StatusOK, err: nil, want: false},
+		{name: "status 400 bad request", status: http.StatusBadRequest, err: errors.New("bad request"), want: false},
+		{name: "status 429 rate limit", status: http.StatusTooManyRequests, err: errors.New("rate limited"), want: false},
+		{name: "status 500 internal error", status: http.StatusInternalServerError, err: errors.New("internal error"), want: false},
+		{name: "plain unrelated error", status: 0, err: errors.New("connection reset by peer"), want: false},
+		{name: "nil error and 0 status", status: 0, err: nil, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsClientCancellation(tc.status, tc.err); got != tc.want {
+				t.Fatalf("IsClientCancellation(%d, %v) = %t, want %t", tc.status, tc.err, got, tc.want)
 			}
 		})
 	}

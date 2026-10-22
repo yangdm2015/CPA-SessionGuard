@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/url"
 
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
@@ -45,7 +45,37 @@ const (
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 	// DerivedSessionIDMetadataKey stores a stable session identity inferred from request context.
+	// It may be used to derive a provider session identity.
 	DerivedSessionIDMetadataKey = "derived_session_id"
+	// LCPAffinitySessionIDMetadataKey stores an LCP-only routing identity. Executors
+	// must not use it as a provider conversation or execution-session identity. The
+	// current phase also keeps it out of SessionTree topology until downstream wiring exists.
+	LCPAffinitySessionIDMetadataKey = "lcp_affinity_session_id"
+	// CanonicalSessionIDMetadataKey stores the single unified session identity reconciled
+	// across explicit harness headers, body fields, execution sessions, LCP inference,
+	// and fallback context derivation for unified debugging and cross-subsystem tracing.
+	CanonicalSessionIDMetadataKey = "canonical_session_id"
+	// ParentSessionIDMetadataKey stores the parent session identity for hierarchical sessions and forks.
+	// For top-level Merkle LCP forks, it represents the deterministic Merkle prefix hash at the divergence point.
+	ParentSessionIDMetadataKey = "parent_session_id"
+	// IsForkMetadataKey indicates whether the request represents a conversational branch or fork.
+	IsForkMetadataKey = "is_fork"
+	// IsCompactionMetadataKey indicates whether the request represents a context compaction continuation.
+	IsCompactionMetadataKey = "is_compaction"
+	// NodeKindMetadataKey indicates the session DAG topology kind ("compaction", "fork", or "trunk").
+	NodeKindMetadataKey = "node_kind"
+	// LCPTailFingerprintsMetadataKey stores the actual trailing turn fingerprints for context compaction matching.
+	LCPTailFingerprintsMetadataKey = "lcp_tail_fingerprints"
+	// LCPEnvironmentDigestMetadataKey stores the environment digest across all system and developer instructions.
+	LCPEnvironmentDigestMetadataKey = "lcp_environment_digest"
+	// LCPAccessGenerationMetadataKey stores the monotonic access generation when an LCP entry was touched or bound.
+	LCPAccessGenerationMetadataKey = "lcp_access_generation"
+	// LCPFingerprintMetadataKey stores bounded request-scoped turn fingerprints so
+	// SessionAffinitySelector.OnResult can avoid reparsing the original payload.
+	LCPFingerprintMetadataKey = "lcp_fingerprints"
+	// LCPMinPrefixLengthMetadataKey stores the minimum eligible prefix boundary for
+	// the bounded LCP fingerprint sequence.
+	LCPMinPrefixLengthMetadataKey = "lcp_min_prefix_length"
 	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
 	CallerScopeMetadataKey = "caller_scope"
 	// SessionAffinityProviderMetadataKey carries the affinity selection namespace
@@ -88,7 +118,7 @@ type RequestAfterAuthInterceptRequest struct {
 	Stream bool
 	// Headers contains the current upstream request headers.
 	Headers http.Header
-	// Body contains the current request payload.
+	// Body contains the current request payload. Treat it as read-only; modifications must be returned in RequestAfterAuthInterceptResponse.Body.
 	Body []byte
 	// Metadata is a best-effort cloned context snapshot. Treat it as read-only and JSON-like.
 	Metadata map[string]any
@@ -96,6 +126,8 @@ type RequestAfterAuthInterceptRequest struct {
 
 // RequestAfterAuthInterceptResponse returns selected-auth request modifications.
 type RequestAfterAuthInterceptResponse struct {
+	// Path optionally overrides the inbound request path in Options.Metadata[RequestPathMetadataKey].
+	Path string
 	// Headers replaces matching current request headers and preserves headers not mentioned here.
 	Headers http.Header
 	// Body replaces the current request body only when non-empty.
@@ -147,6 +179,25 @@ func (e *RequestTerminatedError) ResponseBody() []byte {
 	return append([]byte(nil), e.Body...)
 }
 
+// WebSocketResponseEvent describes an upstream WebSocket response event received during execution.
+type WebSocketResponseEvent struct {
+	RequestID      string
+	TraceID        string
+	SourceFormat   string
+	Model          string
+	RequestedModel string
+	Provider       string
+	AuthID         string
+	AuthLabel      string
+	AuthType       string
+	EventType      string
+	Payload        []byte
+	Metadata       map[string]any
+}
+
+// WebSocketResponseObserver receives upstream WebSocket response events during execution.
+type WebSocketResponseObserver func(context.Context, WebSocketResponseEvent)
+
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
 	// Stream toggles streaming mode.
@@ -168,8 +219,16 @@ type Options struct {
 	Metadata map[string]any
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
+	// WebSocketResponseObserver receives upstream WebSocket response events during execution.
+	WebSocketResponseObserver WebSocketResponseObserver
 	// ExecutionLifecycle owns Home-dispatched execution resources. Executors must not add it to request metadata.
 	ExecutionLifecycle ExecutionLifecycle
+	// ProxyURL overrides the credential and global proxy for this execution only.
+	// Credential refresh and token exchange must ignore it.
+	ProxyURL string
+	// KeepTopLevelEffort tells SIWC request-body rules to keep the resolved
+	// top-level reasoning.effort when configuration_update items are collapsed.
+	KeepTopLevelEffort bool
 }
 
 // EnsureMetadata initializes and returns Metadata, ensuring it is non-nil.

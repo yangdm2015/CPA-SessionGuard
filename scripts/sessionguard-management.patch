@@ -1,0 +1,11 @@
+diff --git a/src/features/quota/providers/antigravity/data.ts b/src/features/quota/providers/antigravity/data.ts
+--- a/src/features/quota/providers/antigravity/data.ts
++++ b/src/features/quota/providers/antigravity/data.ts
+@@ -172,4 +172,6 @@ const fetchAntigravityQuota = async (
+-      const groups = buildAntigravityQuotaGroups(payload);
++      const groups = buildAntigravityQuotaGroups(payload).filter(
++        (group) => !/claude|gpt/i.test(group.label)
++      );
+       if (groups.length === 0) {
+         lastError = t('antigravity_quota.empty_models');
+         continue;

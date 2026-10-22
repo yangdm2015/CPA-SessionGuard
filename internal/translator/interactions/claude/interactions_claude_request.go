@@ -3,22 +3,23 @@ package claude
 import (
 	"strings"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-func ConvertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	return convertClaudeRequestToInteractions(modelName, inputRawJSON, stream, false)
+
 }
 
 // ConvertClaudeRequestToInteractionsWithCompat preserves empty assistant
 // thinking blocks for configured compatibility endpoints.
-func ConvertClaudeRequestToInteractionsWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertClaudeRequestToInteractionsWithCompat(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	return convertClaudeRequestToInteractions(modelName, inputRawJSON, stream, true)
 }
 
-func convertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
+func convertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) ([]byte, error) {
 	root := gjson.ParseBytes(inputRawJSON)
 	out := []byte(`{"model":"","input":[]}`)
 	out, _ = sjson.SetBytes(out, "model", firstNonEmpty(modelName, root.Get("model").String()))
@@ -27,9 +28,9 @@ func convertClaudeRequestToInteractions(modelName string, inputRawJSON []byte, s
 	}
 	out = copyClaudeSystemToInteractions(out, root)
 	out = copyClaudeGenerationConfigToInteractions(out, root)
-	out = appendClaudeMessagesToInteractions(out, root.Get("messages"), preserveEmptyThinkingBlocks)
+	out, errDrops := appendClaudeMessagesToInteractions(out, root.Get("messages"), preserveEmptyThinkingBlocks)
 	out = copyClaudeToolsToInteractions(out, root)
-	return out
+	return out, errDrops
 }
 
 func claudeRequestStreamValue(root gjson.Result, stream bool) (bool, bool) {
@@ -122,36 +123,76 @@ func copyClaudeToolChoiceToInteractions(out []byte, toolChoice gjson.Result) []b
 	return out
 }
 
-func appendClaudeMessagesToInteractions(out []byte, messages gjson.Result, preserveEmptyThinkingBlocks bool) []byte {
+func appendClaudeMessagesToInteractions(out []byte, messages gjson.Result, preserveEmptyThinkingBlocks bool) ([]byte, error) {
 	if !messages.Exists() || !messages.IsArray() {
-		return out
+		return out, nil
 	}
+	var drops translatorcommon.UserTurnDrops
 	inputItems := translatorcommon.NewRawArrayItems(messages.Get("#").Int())
+	var pendingToolUseIDs []string
+	var pendingSystemReminders [][]byte
+	toolNamesByID := make(map[string]string)
+
 	messages.ForEach(func(_, message gjson.Result) bool {
-		appendClaudeMessageToInteractions(&inputItems, message, preserveEmptyThinkingBlocks)
+		role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
+		content := message.Get("content")
+		if role == "system" {
+			if reminderText, ok := translatorcommon.ClaudeMessageSystemReminderText(content); ok {
+				step := []byte(`{"type":"user_input","content":[{"type":"text","text":""}]}`)
+				step, _ = sjson.SetBytes(step, "content.0.text", reminderText)
+				if len(pendingToolUseIDs) > 0 {
+					pendingSystemReminders = append(pendingSystemReminders, step)
+				} else {
+					inputItems = append(inputItems, step)
+				}
+			}
+			return true
+		}
+
+		if role == "user" && len(pendingToolUseIDs) > 0 && content.IsArray() {
+			content = translatorcommon.AlignClaudeToolResults(content, pendingToolUseIDs)
+		}
+		pendingToolUseIDs = nil
+
+		sendable := appendClaudeMessageToInteractions(&inputItems, &pendingToolUseIDs, &pendingSystemReminders, toolNamesByID, role, content, preserveEmptyThinkingBlocks, &drops)
+		if role == "user" {
+			drops.EndTurn(sendable)
+		}
+		if len(pendingSystemReminders) > 0 {
+			inputItems = append(inputItems, pendingSystemReminders...)
+			pendingSystemReminders = nil
+		}
 		return true
 	})
+	if len(pendingSystemReminders) > 0 {
+		inputItems = append(inputItems, pendingSystemReminders...)
+	}
 	out = translatorcommon.SetRawArrayItems(out, "input", inputItems)
-	return out
+	return out, drops.Err()
 }
 
-func appendClaudeMessageToInteractions(items *[][]byte, message gjson.Result, preserveEmptyThinkingBlocks bool) {
-	role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
+func appendClaudeMessageToInteractions(items *[][]byte, pendingToolUseIDs *[]string, pendingSystemReminders *[][]byte, toolNamesByID map[string]string, role string, content gjson.Result, preserveEmptyThinkingBlocks bool, drops *translatorcommon.UserTurnDrops) int {
 	defaultStepType := "user_input"
 	if role == "assistant" {
 		defaultStepType = "model_output"
 	}
-	content := message.Get("content")
 	if content.Type == gjson.String {
+		if pendingSystemReminders != nil && len(*pendingSystemReminders) > 0 {
+			*items = append(*items, *pendingSystemReminders...)
+			*pendingSystemReminders = nil
+		}
 		step := []byte(`{"type":"","content":[{"type":"text","text":""}]}`)
 		step, _ = sjson.SetBytes(step, "type", defaultStepType)
 		step, _ = sjson.SetBytes(step, "content.0.text", content.String())
 		*items = append(*items, step)
-		return
+		return 1
 	}
 	if !content.IsArray() {
-		return
+		return 0
 	}
+	// Counts only what this turn itself sends, not system reminders flushed beside it.
+	// Whitespace-only text is forwarded but never keeps an emptied turn alive.
+	sendable := 0
 	stepContent := make([][]byte, 0, 4)
 	flushContent := func() {
 		if len(stepContent) == 0 {
@@ -168,9 +209,17 @@ func appendClaudeMessageToInteractions(items *[][]byte, message gjson.Result, pr
 		switch partType {
 		case "text":
 			if text := part.Get("text").String(); text != "" {
+				if pendingSystemReminders != nil && len(*pendingSystemReminders) > 0 {
+					flushContent()
+					*items = append(*items, *pendingSystemReminders...)
+					*pendingSystemReminders = nil
+				}
 				contentPart := []byte(`{"type":"text","text":""}`)
 				contentPart, _ = sjson.SetBytes(contentPart, "text", text)
 				stepContent = append(stepContent, contentPart)
+				if strings.TrimSpace(text) != "" {
+					sendable++
+				}
 			}
 		case "thinking":
 			flushContent()
@@ -179,27 +228,55 @@ func appendClaudeMessageToInteractions(items *[][]byte, message gjson.Result, pr
 				step := []byte(`{"type":"thought","content":[{"type":"text","text":""}]}`)
 				step, _ = sjson.SetBytes(step, "content.0.text", text)
 				*items = append(*items, step)
+				sendable++
 			}
-		case "image", "document":
+		case "image", "document", "container_upload":
 			if mediaPart, ok := claudeMediaPartToInteractions(part, partType); ok {
+				if pendingSystemReminders != nil && len(*pendingSystemReminders) > 0 {
+					flushContent()
+					*items = append(*items, *pendingSystemReminders...)
+					*pendingSystemReminders = nil
+				}
 				stepContent = append(stepContent, mediaPart)
+				sendable++
+			} else if drops != nil && role == "user" {
+				drops.Drop(partType)
 			}
 		case "tool_use":
 			flushContent()
+			if id := part.Get("id").String(); id != "" {
+				if pendingToolUseIDs != nil {
+					*pendingToolUseIDs = append(*pendingToolUseIDs, id)
+				}
+				if toolNamesByID != nil {
+					if name := part.Get("name").String(); name != "" {
+						toolNamesByID[id] = name
+					}
+				}
+			}
 			*items = append(*items, claudeToolUseToInteractions(part))
+			sendable++
 		case "tool_result":
 			flushContent()
-			*items = append(*items, claudeToolResultToInteractions(part))
+			*items = append(*items, claudeToolResultToInteractions(part, toolNamesByID))
+			sendable++
 		}
 		return true
 	})
 	flushContent()
+	return sendable
 }
 
 func claudeMediaPartToInteractions(part gjson.Result, partType string) ([]byte, bool) {
 	source := part.Get("source")
 	mimeType := source.Get("media_type").String()
 	data := source.Get("data").String()
+	if data == "" {
+		data = part.Get("data").String()
+	}
+	if mimeType == "" {
+		mimeType = part.Get("mime_type").String()
+	}
 	if mimeType == "" || data == "" {
 		return nil, false
 	}
@@ -215,7 +292,6 @@ func claudeToolUseToInteractions(part gjson.Result) []byte {
 	step, _ = sjson.SetBytes(step, "name", part.Get("name").String())
 	if id := part.Get("id").String(); id != "" {
 		step, _ = sjson.SetBytes(step, "id", id)
-		step, _ = sjson.SetBytes(step, "call_id", id)
 	}
 	input := part.Get("input")
 	if input.Exists() && input.IsObject() {
@@ -224,11 +300,21 @@ func claudeToolUseToInteractions(part gjson.Result) []byte {
 	return step
 }
 
-func claudeToolResultToInteractions(part gjson.Result) []byte {
+func claudeToolResultToInteractions(part gjson.Result, toolNamesByID map[string]string) []byte {
 	step := []byte(`{"type":"function_result","call_id":"","result":""}`)
-	if id := part.Get("tool_use_id").String(); id != "" {
-		step, _ = sjson.SetBytes(step, "id", id)
+	id := part.Get("tool_use_id").String()
+	if id != "" {
 		step, _ = sjson.SetBytes(step, "call_id", id)
+	}
+	name := part.Get("name").String()
+	if name == "" && id != "" && toolNamesByID != nil {
+		name = toolNamesByID[id]
+	}
+	if name != "" {
+		step, _ = sjson.SetBytes(step, "name", name)
+	}
+	if isError := part.Get("is_error"); isError.Exists() && isError.Bool() {
+		step, _ = sjson.SetBytes(step, "is_error", true)
 	}
 	result := part.Get("content")
 	if result.Exists() {
@@ -238,10 +324,37 @@ func claudeToolResultToInteractions(part gjson.Result) []byte {
 		case result.IsArray():
 			contentItems := make([][]byte, 0, 4)
 			result.ForEach(func(_, item gjson.Result) bool {
-				if item.Get("type").String() == "text" {
-					contentPart := []byte(`{"type":"text","text":""}`)
-					contentPart, _ = sjson.SetBytes(contentPart, "text", item.Get("text").String())
-					contentItems = append(contentItems, contentPart)
+				itemType := item.Get("type").String()
+				switch itemType {
+				case "text":
+					isPureText := true
+					if item.IsObject() {
+						item.ForEach(func(k, _ gjson.Result) bool {
+							key := k.String()
+							if key != "type" && key != "text" && key != "cache_control" {
+								isPureText = false
+								return false
+							}
+							return true
+						})
+					}
+					if isPureText {
+						contentPart := []byte(`{"type":"text","text":""}`)
+						contentPart, _ = sjson.SetBytes(contentPart, "text", item.Get("text").String())
+						contentItems = append(contentItems, contentPart)
+					} else if raw := strings.TrimSpace(item.Raw); raw != "" {
+						contentItems = append(contentItems, []byte(raw))
+					}
+				case "image", "document", "container_upload":
+					if mediaPart, ok := claudeMediaPartToInteractions(item, itemType); ok {
+						contentItems = append(contentItems, mediaPart)
+					} else if raw := strings.TrimSpace(item.Raw); raw != "" {
+						contentItems = append(contentItems, []byte(raw))
+					}
+				default:
+					if raw := strings.TrimSpace(item.Raw); raw != "" {
+						contentItems = append(contentItems, []byte(raw))
+					}
 				}
 				return true
 			})
